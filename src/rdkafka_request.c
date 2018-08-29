@@ -36,6 +36,7 @@
 #include "rdkafka_partition.h"
 #include "rdkafka_metadata.h"
 #include "rdkafka_msgset.h"
+#include "rdkafka_idempotence.h"
 
 #include "rdrand.h"
 #include "rdstring.h"
@@ -2505,6 +2506,106 @@ rd_kafka_DescribeConfigsRequest (rd_kafka_broker_t *rkb,
                 rd_kafka_buf_set_abs_timeout(rkbuf, op_timeout+1000, 0);
 
         rd_kafka_buf_ApiVersion_set(rkbuf, ApiVersion, 0);
+
+        rd_kafka_broker_buf_enq_replyq(rkb, rkbuf, replyq, resp_cb, opaque);
+
+        return RD_KAFKA_RESP_ERR_NO_ERROR;
+}
+
+
+
+/**
+ * @brief Parses and handles an InitProducerId reply.
+ *
+ * @returns 0 on success, else an error.
+ *
+ * @locality rdkafka main thread
+ * @locks none
+ */
+void
+rd_kafka_handle_InitProducerId (rd_kafka_t *rk,
+                                rd_kafka_broker_t *rkb,
+                                rd_kafka_resp_err_t err,
+                                rd_kafka_buf_t *rkbuf,
+                                rd_kafka_buf_t *request,
+                                void *opaque) {
+        const int log_decode_errors = LOG_ERR;
+        int16_t error_code;
+        rd_kafka_pid_t pid;
+
+        if (err)
+                goto err;
+
+        rd_kafka_buf_read_throttle_time(rkbuf);
+
+        rd_kafka_buf_read_i16(rkbuf, &error_code);
+        if ((err = error_code))
+                goto err;
+
+        rd_kafka_buf_read_i64(rkbuf, &pid.id);
+        rd_kafka_buf_read_i16(rkbuf, &pid.epoch);
+
+        rd_kafka_idemp_pid_update(rkb, pid);
+
+        return;
+
+ err_parse:
+        err = rkbuf->rkbuf_err;
+ err:
+        /* Retries are performed by idempotence state handler */
+        rd_kafka_idemp_get_pid_failed(rkb, err);
+}
+
+
+/**
+ * @brief Construct and send InitProducerIdRequest to \p rkb.
+ *
+ *        \p transactional_id may be NULL.
+ *        \p transaction_timeout_ms may be set to -1.
+ *
+ *        The response (unparsed) will be handled by \p resp_cb served
+ *        by queue \p replyq.
+ *
+ * @returns RD_KAFKA_RESP_ERR_NO_ERROR if the request was enqueued for
+ *          transmission, otherwise an error code and errstr will be
+ *          updated with a human readable error string.
+ */
+rd_kafka_resp_err_t
+rd_kafka_InitProducerIdRequest (rd_kafka_broker_t *rkb,
+                                const char *transactional_id,
+                                int transaction_timeout_ms,
+                                char *errstr, size_t errstr_size,
+                                rd_kafka_replyq_t replyq,
+                                rd_kafka_resp_cb_t *resp_cb,
+                                void *opaque) {
+        rd_kafka_buf_t *rkbuf;
+        int16_t ApiVersion = 0;
+
+        ApiVersion = rd_kafka_broker_ApiVersion_supported(
+                rkb, RD_KAFKAP_InitProducerId, 0, 1, NULL);
+        if (ApiVersion == -1) {
+                rd_snprintf(errstr, errstr_size,
+                            "InitProducerId (KIP-98) not supported "
+                            "by broker, requires broker version >= 0.11.0");
+                rd_kafka_replyq_destroy(&replyq);
+                return RD_KAFKA_RESP_ERR__UNSUPPORTED_FEATURE;
+        }
+
+        rkbuf = rd_kafka_buf_new_request(rkb, RD_KAFKAP_InitProducerId, 1,
+                                         2 + (transactional_id ?
+                                              strlen(transactional_id) : 0) +
+                                         4);
+
+        /* transactional_id */
+        rd_kafka_buf_write_str(rkbuf, transactional_id, -1);
+
+        /* transaction_timeout_ms */
+        rd_kafka_buf_write_i32(rkbuf, transaction_timeout_ms);
+
+        rd_kafka_buf_ApiVersion_set(rkbuf, ApiVersion, 0);
+
+        /* Let the idempotence state handler perform retries */
+        rkbuf->rkbuf_retries = RD_KAFKA_BUF_NO_RETRIES;
 
         rd_kafka_broker_buf_enq_replyq(rkb, rkbuf, replyq, resp_cb, opaque);
 

@@ -432,6 +432,19 @@ rd_tmpabuf_write_str0 (const char *func, int line,
 
 
 /**
+ * @brief Read throttle_time_ms (i32) from response and pass the value
+ *        to the throttle handling code.
+ */
+#define rd_kafka_buf_read_throttle_time(rkbuf) do {                     \
+                int32_t _throttle_time_ms;                              \
+                rd_kafka_buf_read_i32(rkbuf, &_throttle_time_ms);       \
+                rd_kafka_op_throttle_time((rkbuf)->rkbuf_rkb,           \
+                                          (rkbuf)->rkbuf_rkb->rkb_rk->rk_rep, \
+                                          _throttle_time_ms);           \
+        } while (0)
+
+
+/**
  * Response handling callback.
  *
  * NOTE: Callbacks must check for 'err == RD_KAFKA_RESP_ERR__DESTROY'

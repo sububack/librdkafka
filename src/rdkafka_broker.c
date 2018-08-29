@@ -4208,13 +4208,43 @@ const char *rd_kafka_broker_name (rd_kafka_broker_t *rkb) {
  * @brief Send dummy OP to broker thread to wake it up from IO sleep.
  *
  * @locality any
- * @locks none
+ * @locks any
  */
 void rd_kafka_broker_wakeup (rd_kafka_broker_t *rkb) {
         rd_kafka_op_t *rko = rd_kafka_op_new(RD_KAFKA_OP_WAKEUP);
         rd_kafka_op_set_prio(rko, RD_KAFKA_PRIO_FLASH);
         rd_kafka_q_enq(rkb->rkb_ops, rko);
         rd_rkb_dbg(rkb, QUEUE, "WAKEUP", "Wake-up");
+}
+
+/**
+ * @brief Wake up all broker threads that are in at least state \p min_state
+ *
+ * @locality any
+ * @locks none: rd_kafka_*lock() MUST NOT be held
+ *
+ * @returns the number of broker threads woken up
+ */
+int rd_kafka_all_brokers_wakeup (rd_kafka_t *rk, int min_state) {
+        int cnt = 0;
+        rd_kafka_broker_t *rkb;
+
+        rd_kafka_rdlock(rk);
+        TAILQ_FOREACH(rkb, &rk->rk_brokers, rkb_link) {
+                int do_wakeup;
+
+                rd_kafka_broker_lock(rkb);
+                do_wakeup = (int)rkb->rkb_state >= min_state;
+                rd_kafka_broker_unlock(rkb);
+
+                if (do_wakeup) {
+                        rd_kafka_broker_wakeup(rkb);
+                        cnt += 1;
+                }
+        }
+        rd_kafka_rdunlock(rk);
+
+        return cnt;
 }
 
 

@@ -48,6 +48,7 @@
 #include "rdkafka_event.h"
 #include "rdkafka_sasl.h"
 #include "rdkafka_interceptor.h"
+#include "rdkafka_idempotence.h"
 
 #include "rdtime.h"
 #include "crc32c.h"
@@ -679,7 +680,7 @@ void rd_kafka_destroy_final (rd_kafka_t *rk) {
 		rd_kafka_metadata_destroy(rk->rk_full_metadata);
         rd_kafkap_str_destroy(rk->rk_client_id);
         rd_kafkap_str_destroy(rk->rk_group_id);
-        rd_kafkap_str_destroy(rk->rk_eos.TransactionalId);
+        rd_kafkap_str_destroy(rk->rk_eos.transactional_id);
 	rd_kafka_anyconf_destroy(_RK_GLOBAL, &rk->rk_conf);
         rd_list_destroy(&rk->rk_broker_by_id);
 
@@ -1411,6 +1412,9 @@ static int rd_kafka_thread_main (void *arg) {
                 rd_kafka_q_fwd_set(rk->rk_cgrp->rkcg_ops, rk->rk_ops);
         }
 
+        if (rd_kafka_is_idempotent(rk))
+                rd_kafka_idemp_init(rk);
+
 	while (likely(!rd_kafka_terminating(rk) ||
 		      rd_kafka_q_len(rk->rk_ops))) {
                 rd_ts_t sleeptime = rd_kafka_timers_next(
@@ -1424,6 +1428,9 @@ static int rd_kafka_thread_main (void *arg) {
 
         rd_kafka_dbg(rk, GENERIC, "TERMINATE",
                      "Internal main thread terminating");
+
+        if (rd_kafka_is_idempotent(rk))
+                rd_kafka_idemp_term(rk);
 
 	rd_kafka_q_disable(rk->rk_ops);
 	rd_kafka_q_purge(rk->rk_ops);
@@ -1523,6 +1530,17 @@ rd_kafka_t *rd_kafka_new (rd_kafka_type_t type, rd_kafka_conf_t *app_conf,
                  * room for protocol framing (including topic name). */
                 conf->recv_max_msg_size = RD_MAX(conf->recv_max_msg_size,
                                                  conf->fetch_max_bytes + 512);
+
+                /* Simplifies rd_kafka_is_idempotent() which is producer-only */
+                conf->idempotence = 0;
+
+        } else if (type == RD_KAFKA_PRODUCER && conf->idempotence) {
+                /* Adjust configuration values for idempotent producer. */
+
+                conf->max_inflight = RD_MIN(conf->max_inflight, 5);
+                conf->max_retries = RD_MAX(conf->max_retries, 1);
+                /* acks=all and queuing.strategy are set per-topic
+                 * in topic_new0() */
         }
 
         if (conf->metadata_max_age_ms == -1) {
@@ -1666,7 +1684,7 @@ rd_kafka_t *rd_kafka_new (rd_kafka_type_t type, rd_kafka_conf_t *app_conf,
                                                 rk->rk_group_id,
                                                 rk->rk_client_id);
 
-
+        rk->rk_eos.transactional_id = rd_kafkap_str_new(NULL, 0);
 
 #ifndef _MSC_VER
         /* Block all signals in newly created threads.
@@ -1746,9 +1764,6 @@ rd_kafka_t *rd_kafka_new (rd_kafka_type_t type, rd_kafka_conf_t *app_conf,
         /*
          * @warning `goto fail` is prohibited past this point
          */
-
-        rk->rk_eos.PID = -1;
-        rk->rk_eos.TransactionalId = rd_kafkap_str_new(NULL, 0);
 
         mtx_lock(&rk->rk_internal_rkb_lock);
 	rk->rk_internal_rkb = rd_kafka_broker_add(rk, RD_KAFKA_INTERNAL,

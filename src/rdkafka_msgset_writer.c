@@ -151,7 +151,7 @@ rd_kafka_msgset_writer_alloc_buf (rd_kafka_msgset_writer_t *msetw) {
         {
         case 3:
                 /* Add TransactionalId */
-                hdrsize += RD_KAFKAP_STR_SIZE(rk->rk_eos.TransactionalId);
+                hdrsize += RD_KAFKAP_STR_SIZE(rk->rk_eos.transactional_id);
                 /* FALLTHRU */
         case 0:
         case 1:
@@ -294,11 +294,11 @@ rd_kafka_msgset_writer_write_MessageSet_v2_header (
         /* MaxTimestamp: updated later */
         rd_kafka_buf_write_i64(rkbuf, 0);
 
-        /* ProducerId */
-        rd_kafka_buf_write_i64(rkbuf, rk->rk_eos.PID);
+        /* ProducerId */ /* FIXME: locking */
+        rd_kafka_buf_write_i64(rkbuf, rk->rk_eos.pid.id);
 
         /* ProducerEpoch */
-        rd_kafka_buf_write_i16(rkbuf, rk->rk_eos.ProducerEpoch);
+        rd_kafka_buf_write_i16(rkbuf, rk->rk_eos.pid.epoch);
 
         /* BaseSequence */
         rd_kafka_buf_write_i32(rkbuf, -1);
@@ -324,7 +324,7 @@ rd_kafka_msgset_writer_write_Produce_header (rd_kafka_msgset_writer_t *msetw) {
 
         /* V3: TransactionalId */
         if (msetw->msetw_ApiVersion == 3)
-                rd_kafka_buf_write_kstr(rkbuf, rk->rk_eos.TransactionalId);
+                rd_kafka_buf_write_kstr(rkbuf, rk->rk_eos.transactional_id);
 
         /* RequiredAcks */
         rd_kafka_buf_write_i16(rkbuf, rkt->rkt_conf.required_acks);

@@ -111,7 +111,73 @@ typedef RD_SHARED_PTR_TYPE(, struct rd_kafka_itopic_s) shptr_rd_kafka_itopic_t;
 
 
 
+/**
+ * @enum Idempotent Producer state
+ */
+typedef enum {
+        RD_KAFKA_IDEMP_STATE_INIT,
+        RD_KAFKA_IDEMP_STATE_TERM,
+        RD_KAFKA_IDEMP_STATE_GET_PID,
+        RD_KAFKA_IDEMP_STATE_WAIT_PID,
+        RD_KAFKA_IDEMP_STATE_ASSIGNED
+} rd_kafka_idemp_state_t;
 
+/**
+ * @returns the idemp_state_t string representation
+ */
+static RD_UNUSED const char *
+rd_kafka_idemp_state2str (rd_kafka_idemp_state_t state) {
+        static const char *names[] = {
+                "Init",
+                "Terminate",
+                "GetPID",
+                "WaitPID",
+                "Assigned"
+        };
+        return names[state];
+}
+
+
+/**
+ * @brief Producer ID and Epoch
+ */
+typedef struct rd_kafka_pid_s {
+        int64_t id;     /**< Producer Id */
+        int16_t epoch;  /**< Producer Epoch */
+} rd_kafka_pid_t;
+
+/**
+ * @returns true if \p PID is valid
+ */
+#define rd_kafka_pid_valid(PID) ((PID).id != -1)
+
+/**
+ * @returns the string representation of a PID in a thread-safe
+ *          static buffer.
+ */
+static RD_UNUSED const char *
+rd_kafka_pid2str (const rd_kafka_pid_t pid) {
+        static RD_TLS char buf[2][64];
+        static RD_TLS int i;
+
+        if (!rd_kafka_pid_valid(pid))
+                return "PID{Invalid}";
+
+        i = (i + 1) % 2;
+
+        rd_snprintf(buf[i], sizeof(buf[i]),
+                    "PID{Id:%"PRId64",Epoch:%hd}", pid.id, pid.epoch);
+
+        return buf[i];
+}
+
+/**
+ * @brief Reset the PID to invalid/init state
+ */
+static RD_UNUSED RD_INLINE void rd_kafka_pid_reset (rd_kafka_pid_t *pid) {
+        pid->id = -1;
+        pid->epoch = -1;
+}
 
 
 /**
@@ -220,12 +286,19 @@ struct rd_kafka_s {
         rd_atomic32_t    rk_simple_cnt;
 
         /**
-         * Exactly Once Semantics
+         * Exactly Once Semantics and Idempotent Producer
+         *
+         * @locks rk_lock
          */
         struct {
-                rd_kafkap_str_t *TransactionalId;
-                int64_t          PID;
-                int16_t          ProducerEpoch;
+                rd_kafka_idemp_state_t idemp_state;
+                rd_ts_t ts_idemp_state; /**< Last state change */
+
+                rd_kafka_pid_t pid;  /**< Current Producer ID and Epoch */
+                rd_kafka_timer_t get_pid_tmr; /**< Timer for pid retrieval */
+
+                rd_kafkap_str_t *transactional_id; /**< Transactional Id,
+                                                    *   a null string. */
         } rk_eos;
 
 	const rd_kafkap_bytes_t *rk_null_bytes;
@@ -408,6 +481,12 @@ void rd_kafka_destroy_final (rd_kafka_t *rk);
 int rd_kafka_simple_consumer_add (rd_kafka_t *rk);
 
 
+/**
+ * @returns true if idempotency is enabled (producer only).
+ */
+#define rd_kafka_is_idempotent(rk) ((rk)->rk_conf.idempotence)
+
+
 #include "rdkafka_topic.h"
 #include "rdkafka_partition.h"
 
@@ -442,6 +521,7 @@ int rd_kafka_simple_consumer_add (rd_kafka_t *rk);
 #define RD_KAFKA_DBG_PLUGIN         0x1000
 #define RD_KAFKA_DBG_CONSUMER       0x2000
 #define RD_KAFKA_DBG_ADMIN          0x4000
+#define RD_KAFKA_DBG_EOS            0x8000
 #define RD_KAFKA_DBG_ALL            0xffff
 #define RD_KAFKA_DBG_NONE           0x0
 
