@@ -305,7 +305,8 @@ struct rd_kafka_s {
                 rd_ts_t ts_idemp_state; /**< Last state change */
 
                 rd_kafka_pid_t pid;  /**< Current Producer ID and Epoch */
-                rd_kafka_timer_t request_pid_tmr; /**< Timer for pid retrieval */
+                int epoch_cnt;       /**< Number of times pid/epoch changed */
+                rd_kafka_timer_t request_pid_tmr; /**< Timer for pid retrieval*/
 
                 rd_kafkap_str_t *transactional_id; /**< Transactional Id,
                                                     *   a null string. */

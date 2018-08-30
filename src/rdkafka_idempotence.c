@@ -246,6 +246,7 @@ void rd_kafka_idemp_pid_update (rd_kafka_broker_t *rkb,
                 rd_kafka_dbg(rk, EOS, "GETPID",
                              "Acquired %s", rd_kafka_pid2str(pid));
         rk->rk_eos.pid = pid;
+        rk->rk_eos.epoch_cnt++;
 
         rd_kafka_idemp_set_state(rk, RD_KAFKA_IDEMP_STATE_ASSIGNED);
 

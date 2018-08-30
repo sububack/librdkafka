@@ -1308,6 +1308,22 @@ static void rd_kafka_stats_emit_all (rd_kafka_t *rk) {
                            rkcg->rkcg_c.rebalance_cnt,
                            rkcg->rkcg_c.assignment_size);
         }
+
+        if (rd_kafka_is_idempotent(rk)) {
+                _st_printf(", \"eos\": { "
+                           "\"idemp_state\": \"%s\", "
+                           "\"idemp_state_age\": %"PRId64", "
+                           "\"producer_id\": %"PRId64", "
+                           "\"producer_epoch\": %hd, "
+                           "\"epoch_cnt\": %d "
+                           "}",
+                           rd_kafka_idemp_state2str(rk->rk_eos.idemp_state),
+                           (rd_clock() - rk->rk_eos.ts_idemp_state) / 1000,
+                           rk->rk_eos.pid.id,
+                           rk->rk_eos.pid.epoch,
+                           rk->rk_eos.epoch_cnt);
+        }
+
 	rd_kafka_rdunlock(rk);
 
         /* Total counters */

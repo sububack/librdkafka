@@ -69,8 +69,8 @@ typedef struct rd_kafka_msgset_writer_s {
         struct {
                 size_t     of;  /* rkbuf's first message position */
                 int64_t    timestamp;
-                int64_t    msgseq; /**< Message sequence after adjusting
-                                    *   for current epoch. */
+                int32_t    msgseq; /**< Message sequence after adjusting
+                                    *   for current epoch and wrapping. */
         } msetw_firstmsg;
 
         rd_kafka_pid_t msetw_pid;        /**< Idempotent producer's
@@ -303,8 +303,8 @@ rd_kafka_msgset_writer_write_MessageSet_v2_header (
         /* ProducerEpoch */
         rd_kafka_buf_write_i16(rkbuf, msetw->msetw_pid.epoch);
 
-        /* BaseSequence */
-        rd_kafka_buf_write_i32(rkbuf, msetw->msetw_firstmsg.msgseq);
+        /* BaseSequence: updated later in case of Idempotent Producer */
+        rd_kafka_buf_write_i32(rkbuf, -1);
 
         /* RecordCount: udpated later */
         rd_kafka_buf_write_i32(rkbuf, 0);
@@ -739,10 +739,16 @@ rd_kafka_msgset_writer_write_msgq (rd_kafka_msgset_writer_t *msetw,
         rd_kafka_assert(NULL, rkm);
         msetw->msetw_firstmsg.timestamp = rkm->rkm_timestamp;
 
-        if (rd_kafka_pid_valid(rktp->rktp_pid))
-                msetw->msetw_firstmsg.msgseq =
-                        rktp->rktp_msgseq - rktp->rktp_epoch_base_seq;
-        else
+        /* Idempotent Producer: Acquire BaseSequence from first message */
+        if (rd_kafka_pid_valid(rktp->rktp_pid)) {
+                /* Our sequence counter is 64-bits, but the
+                 * Kafka protocol's is only 31 (signed), so we'll
+                 * need to handle wrapping. */
+                msetw->msetw_firstmsg.msgseq = (int32_t)
+                        ((rkm->rkm_u.producer.msgseq -
+                          rktp->rktp_epoch_base_seq) %
+                         ((uint64_t)INT32_MAX + 1));
+        } else
                 msetw->msetw_firstmsg.msgseq = -1;
 
         /*
@@ -1129,6 +1135,10 @@ rd_kafka_msgset_writer_finalize_MessageSet_v2_header (
                                 msetw->msetw_MaxTimestamp);
 
         rd_kafka_buf_update_i32(rkbuf, msetw->msetw_of_start +
+                                RD_KAFKAP_MSGSET_V2_OF_BaseSequence,
+                                msetw->msetw_firstmsg.msgseq);
+
+        rd_kafka_buf_update_i32(rkbuf, msetw->msetw_of_start +
                                 RD_KAFKAP_MSGSET_V2_OF_RecordCount, msgcnt);
 
         rd_kafka_msgset_writer_calc_crc_v2(msetw);
@@ -1210,10 +1220,11 @@ rd_kafka_msgset_writer_finalize (rd_kafka_msgset_writer_t *msetw,
         rd_rkb_dbg(msetw->msetw_rkb, MSG, "PRODUCE",
                    "%s [%"PRId32"]: "
                    "Produce MessageSet with %i message(s) (%"PRIusz" bytes, "
-                   "ApiVersion %d, MsgVersion %d)",
+                   "ApiVersion %d, MsgVersion %d, BaseSeq %"PRId32")",
                    rktp->rktp_rkt->rkt_topic->str, rktp->rktp_partition,
                    cnt, msetw->msetw_MessageSetSize,
-                   msetw->msetw_ApiVersion, msetw->msetw_MsgVersion);
+                   msetw->msetw_ApiVersion, msetw->msetw_MsgVersion,
+                   msetw->msetw_firstmsg.msgseq);
 
         return rkbuf;
 }
