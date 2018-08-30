@@ -347,6 +347,8 @@ typedef enum {
         RD_KAFKA_RESP_ERR__UNDERFLOW = -155,
         /** Invalid type */
         RD_KAFKA_RESP_ERR__INVALID_TYPE = -154,
+        /** Retry operation */
+        RD_KAFKA_RESP_ERR__RETRY = -153,
 
 	/** End internal error codes */
 	RD_KAFKA_RESP_ERR__END = -100,

@@ -31,12 +31,12 @@
 #define _RD_KAFKA_IDEMPOTENCE_H_
 
 
-void rd_kafka_idemp_get_pid_failed (rd_kafka_broker_t *rkb,
-                                    rd_kafka_resp_err_t err);
+void rd_kafka_idemp_request_pid_failed (rd_kafka_broker_t *rkb,
+                                        rd_kafka_resp_err_t err);
 void rd_kafka_idemp_pid_update (rd_kafka_broker_t *rkb,
                                 const rd_kafka_pid_t pid);
-int rd_kafka_idemp_get_pid (rd_kafka_t *rk, rd_kafka_broker_t *rkb,
-                            const char *reason);
+int rd_kafka_idemp_request_pid (rd_kafka_t *rk, rd_kafka_broker_t *rkb,
+                                const char *reason);
 
 
 void rd_kafka_idemp_init (rd_kafka_t *rk);

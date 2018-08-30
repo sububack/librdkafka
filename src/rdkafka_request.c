@@ -1768,6 +1768,11 @@ rd_kafka_handle_Produce_parse (rd_kafka_broker_t *rkb,
 /**
  * @brief Handle ProduceResponse
  *
+ * @remark ProduceRequests are never retried, retriable errors are
+ *         instead handled by re-enqueuing the request's messages back
+ *         on the partition queue to have a new ProduceRequest constructed
+ *         eventually.
+ *
  * @locality broker thread
  */
 static void rd_kafka_handle_Produce (rd_kafka_t *rk,
@@ -1776,7 +1781,7 @@ static void rd_kafka_handle_Produce (rd_kafka_t *rk,
                                      rd_kafka_buf_t *reply,
                                      rd_kafka_buf_t *request,
                                      void *opaque) {
-        shptr_rd_kafka_toppar_t *s_rktp = opaque; /* from ProduceRequest() */
+        shptr_rd_kafka_toppar_t *s_rktp = request->rkbuf_u.Produce.s_rktp;
         rd_kafka_toppar_t *rktp = rd_kafka_toppar_s2i(s_rktp);
         int64_t offset = RD_KAFKA_OFFSET_INVALID;
         int64_t timestamp = -1;
@@ -1787,6 +1792,11 @@ static void rd_kafka_handle_Produce (rd_kafka_t *rk,
                                                     reply, request,
                                                     &offset, &timestamp);
 
+        /* Decrease partition's messages in-flight counter */
+        rd_assert(rd_atomic32_get(&rktp->rktp_msgs_inflight) >=
+                  rd_kafka_msgq_len(&request->rkbuf_msgq));
+        rd_atomic32_sub(&rktp->rktp_msgs_inflight,
+                        rd_kafka_msgq_len(&request->rkbuf_msgq));
 
         if (likely(!err)) {
                 rd_rkb_dbg(rkb, MSG, "MSGSET",
@@ -1801,7 +1811,7 @@ static void rd_kafka_handle_Produce (rd_kafka_t *rk,
                 char actstr[64];
 
                 if (err == RD_KAFKA_RESP_ERR__DESTROY)
-                        goto done; /* Terminating */
+                        return; /* Terminating */
 
                 actions = rd_kafka_err_action(
                         rkb, err, reply, request,
@@ -1826,6 +1836,11 @@ static void rd_kafka_handle_Produce (rd_kafka_t *rk,
 
                         RD_KAFKA_ERR_ACTION_PERMANENT,
                         RD_KAFKA_RESP_ERR__MSG_TIMED_OUT,
+
+                        /* Message was purged from out-queue due to
+                         * Idempotent Producer Id change */
+                        RD_KAFKA_ERR_ACTION_RETRY,
+                        RD_KAFKA_RESP_ERR__RETRY,
 
                         RD_KAFKA_ERR_ACTION_END);
 
@@ -1888,7 +1903,7 @@ static void rd_kafka_handle_Produce (rd_kafka_t *rk,
                                 /* No need do anything more with the request
                                  * here since the request no longer has any
                                  messages associated with it. */
-                                goto done;
+                                return;
                         }
                 }
 
@@ -1930,9 +1945,6 @@ static void rd_kafka_handle_Produce (rd_kafka_t *rk,
 
         /* Enqueue messages for delivery report */
         rd_kafka_dr_msgq(rktp->rktp_rkt, &request->rkbuf_msgq, err);
-
- done:
-        rd_kafka_toppar_destroy(s_rktp); /* from ProduceRequest() */
 }
 
 
@@ -1943,7 +1955,8 @@ static void rd_kafka_handle_Produce (rd_kafka_t *rk,
  *
  * @locality broker thread
  */
-int rd_kafka_ProduceRequest (rd_kafka_broker_t *rkb, rd_kafka_toppar_t *rktp) {
+int rd_kafka_ProduceRequest (rd_kafka_broker_t *rkb, rd_kafka_toppar_t *rktp,
+                             const rd_kafka_pid_t pid) {
         rd_kafka_buf_t *rkbuf;
         rd_kafka_itopic_t *rkt = rktp->rktp_rkt;
         size_t MessageSetSize = 0;
@@ -1956,7 +1969,7 @@ int rd_kafka_ProduceRequest (rd_kafka_broker_t *rkb, rd_kafka_toppar_t *rktp) {
          * Create ProduceRequest with as many messages from the toppar
          * transmit queue as possible.
          */
-        rkbuf = rd_kafka_msgset_create_ProduceRequest(rkb, rktp,
+        rkbuf = rd_kafka_msgset_create_ProduceRequest(rkb, rktp, pid,
                                                       &MessageSetSize);
         if (unlikely(!rkbuf))
                 return 0;
@@ -1988,11 +2001,15 @@ int rd_kafka_ProduceRequest (rd_kafka_broker_t *rkb, rd_kafka_toppar_t *rktp) {
          * capped by socket.timeout.ms */
         rd_kafka_buf_set_abs_timeout(rkbuf, tmout, now);
 
+        rd_atomic32_add(&rktp->rktp_msgs_inflight,
+                        rd_kafka_msgq_len(&rkbuf->rkbuf_msgq));
+
+        /* Reference is dropped in buf_destroy() */
+        rkbuf->rkbuf_u.Produce.s_rktp = rd_kafka_toppar_keep(rktp);
+
         rd_kafka_broker_buf_enq_replyq(rkb, rkbuf,
                                        RD_KAFKA_NO_REPLYQ,
-                                       rd_kafka_handle_Produce,
-                                       /* toppar ref for handle_Produce() */
-                                       rd_kafka_toppar_keep(rktp));
+                                       rd_kafka_handle_Produce, NULL);
 
         return cnt;
 }
@@ -2553,7 +2570,7 @@ rd_kafka_handle_InitProducerId (rd_kafka_t *rk,
         err = rkbuf->rkbuf_err;
  err:
         /* Retries are performed by idempotence state handler */
-        rd_kafka_idemp_get_pid_failed(rkb, err);
+        rd_kafka_idemp_request_pid_failed(rkb, err);
 }
 
 

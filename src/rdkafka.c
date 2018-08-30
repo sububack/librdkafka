@@ -416,6 +416,8 @@ static const struct rd_kafka_err_desc rd_kafka_err_descs[] = {
                   "Local: Read underflow"),
         _ERR_DESC(RD_KAFKA_RESP_ERR__INVALID_TYPE,
                   "Local: Invalid type"),
+        _ERR_DESC(RD_KAFKA_RESP_ERR__RETRY,
+                  "Local: Retry operation"),
 
 	_ERR_DESC(RD_KAFKA_RESP_ERR_UNKNOWN,
 		  "Unknown broker error"),
@@ -1067,7 +1069,8 @@ static RD_INLINE void rd_kafka_stats_emit_toppar (struct _stats_emit *st,
                    "\"rxmsgs\":%"PRIu64", "
                    "\"rxbytes\":%"PRIu64", "
                    "\"msgs\": %"PRIu64", "
-                   "\"rx_ver_drops\": %"PRIu64" "
+                   "\"rx_ver_drops\": %"PRIu64", "
+                   "\"msgs_inflight\": %"PRId32" "
 		   "} ",
 		   first ? "" : ", ",
 		   rktp->rktp_partition,
@@ -1100,7 +1103,8 @@ static RD_INLINE void rd_kafka_stats_emit_toppar (struct _stats_emit *st,
                    rk->rk_type == RD_KAFKA_PRODUCER ?
                    rd_atomic64_get(&rktp->rktp_c.producer_enq_msgs) :
                    rd_atomic64_get(&rktp->rktp_c.rx_msgs), /* legacy, same as rx_msgs */
-                   rd_atomic64_get(&rktp->rktp_c.rx_ver_drops));
+                   rd_atomic64_get(&rktp->rktp_c.rx_ver_drops),
+                   rd_atomic32_get(&rktp->rktp_msgs_inflight));
 
         if (total) {
                 total->txmsgs      += rd_atomic64_get(&rktp->rktp_c.tx_msgs);

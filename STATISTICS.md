@@ -178,6 +178,7 @@ rxmsgs | int | | Total number of messages consumed, not including ignored messag
 rxbytes | int | | Total number of bytes received for rxmsgs
 msgs | int | | Total number of messages received (consumer, same as rxmsgs), or total number of messages produced (possibly not yet transmitted) (producer).
 rx_ver_drops | int | | Dropped outdated messages
+msgs_inflight | int gauge | | Current number of messages in-flight to/from broker
 
 
 ## cgrp

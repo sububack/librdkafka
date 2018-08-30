@@ -69,8 +69,12 @@ typedef struct rd_kafka_msgset_writer_s {
         struct {
                 size_t     of;  /* rkbuf's first message position */
                 int64_t    timestamp;
+                int64_t    msgseq; /**< Message sequence after adjusting
+                                    *   for current epoch. */
         } msetw_firstmsg;
 
+        rd_kafka_pid_t msetw_pid;        /**< Idempotent producer's
+                                          *   current Producer Id */
         rd_kafka_broker_t *msetw_rkb;    /* @warning Not a refcounted
                                           *          reference! */
         rd_kafka_toppar_t *msetw_rktp;   /* @warning Not a refcounted
@@ -258,7 +262,6 @@ static void
 rd_kafka_msgset_writer_write_MessageSet_v2_header (
         rd_kafka_msgset_writer_t *msetw) {
         rd_kafka_buf_t *rkbuf = msetw->msetw_rkbuf;
-        rd_kafka_t *rk = msetw->msetw_rkb->rkb_rk;
 
         rd_kafka_assert(NULL, msetw->msetw_ApiVersion >= 3);
         rd_kafka_assert(NULL, msetw->msetw_MsgVersion == 2);
@@ -294,14 +297,14 @@ rd_kafka_msgset_writer_write_MessageSet_v2_header (
         /* MaxTimestamp: updated later */
         rd_kafka_buf_write_i64(rkbuf, 0);
 
-        /* ProducerId */ /* FIXME: locking */
-        rd_kafka_buf_write_i64(rkbuf, rk->rk_eos.pid.id);
+        /* ProducerId */
+        rd_kafka_buf_write_i64(rkbuf, msetw->msetw_pid.id);
 
         /* ProducerEpoch */
-        rd_kafka_buf_write_i16(rkbuf, rk->rk_eos.pid.epoch);
+        rd_kafka_buf_write_i16(rkbuf, msetw->msetw_pid.epoch);
 
         /* BaseSequence */
-        rd_kafka_buf_write_i32(rkbuf, -1);
+        rd_kafka_buf_write_i32(rkbuf, msetw->msetw_firstmsg.msgseq);
 
         /* RecordCount: udpated later */
         rd_kafka_buf_write_i32(rkbuf, 0);
@@ -372,8 +375,9 @@ rd_kafka_msgset_writer_write_Produce_header (rd_kafka_msgset_writer_t *msetw) {
  * @locality broker thread
  */
 static int rd_kafka_msgset_writer_init (rd_kafka_msgset_writer_t *msetw,
-                                         rd_kafka_broker_t *rkb,
-                                         rd_kafka_toppar_t *rktp) {
+                                        rd_kafka_broker_t *rkb,
+                                        rd_kafka_toppar_t *rktp,
+                                        rd_kafka_pid_t pid) {
         int msgcnt = rktp->rktp_xmit_msgq.rkmq_msg_cnt;
 
         if (msgcnt == 0)
@@ -383,6 +387,7 @@ static int rd_kafka_msgset_writer_init (rd_kafka_msgset_writer_t *msetw,
 
         msetw->msetw_rktp = rktp;
         msetw->msetw_rkb = rkb;
+        msetw->msetw_pid = pid;
 
         /* Max number of messages to send in a batch,
          * limited by current queue size or configured batch size,
@@ -733,6 +738,12 @@ rd_kafka_msgset_writer_write_msgq (rd_kafka_msgset_writer_t *msetw,
         rkm = TAILQ_FIRST(&rkmq->rkmq_msgs);
         rd_kafka_assert(NULL, rkm);
         msetw->msetw_firstmsg.timestamp = rkm->rkm_timestamp;
+
+        if (rd_kafka_pid_valid(rktp->rktp_pid))
+                msetw->msetw_firstmsg.msgseq =
+                        rktp->rktp_msgseq - rktp->rktp_epoch_base_seq;
+        else
+                msetw->msetw_firstmsg.msgseq = -1;
 
         /*
          * Write as many messages as possible until buffer is full
@@ -1225,11 +1236,12 @@ rd_kafka_msgset_writer_finalize (rd_kafka_msgset_writer_t *msetw,
 rd_kafka_buf_t *
 rd_kafka_msgset_create_ProduceRequest (rd_kafka_broker_t *rkb,
                                        rd_kafka_toppar_t *rktp,
+                                       const rd_kafka_pid_t pid,
                                        size_t *MessageSetSizep) {
 
         rd_kafka_msgset_writer_t msetw;
 
-        if (rd_kafka_msgset_writer_init(&msetw, rkb, rktp) == 0)
+        if (rd_kafka_msgset_writer_init(&msetw, rkb, rktp, pid) == 0)
                 return NULL;
 
         rd_kafka_msgset_writer_write_msgq(&msetw, &rktp->rktp_xmit_msgq);

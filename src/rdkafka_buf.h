@@ -589,6 +589,9 @@ struct rd_kafka_buf_s { /* rd_kafka_buf_t */
                         mtx_t *decr_lock;
 
                 } Metadata;
+                struct {
+                        shptr_rd_kafka_toppar_t *s_rktp;
+                } Produce;
         } rkbuf_u;
 
         const char *rkbuf_uflow_mitigation; /**< Buffer read underflow

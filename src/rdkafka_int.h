@@ -117,7 +117,7 @@ typedef RD_SHARED_PTR_TYPE(, struct rd_kafka_itopic_s) shptr_rd_kafka_itopic_t;
 typedef enum {
         RD_KAFKA_IDEMP_STATE_INIT,
         RD_KAFKA_IDEMP_STATE_TERM,
-        RD_KAFKA_IDEMP_STATE_GET_PID,
+        RD_KAFKA_IDEMP_STATE_REQ_PID,
         RD_KAFKA_IDEMP_STATE_WAIT_PID,
         RD_KAFKA_IDEMP_STATE_ASSIGNED
 } rd_kafka_idemp_state_t;
@@ -130,7 +130,7 @@ rd_kafka_idemp_state2str (rd_kafka_idemp_state_t state) {
         static const char *names[] = {
                 "Init",
                 "Terminate",
-                "GetPID",
+                "RequestPID",
                 "WaitPID",
                 "Assigned"
         };
@@ -146,10 +146,20 @@ typedef struct rd_kafka_pid_s {
         int16_t epoch;  /**< Producer Epoch */
 } rd_kafka_pid_t;
 
+#define RD_KAFKA_PID_INITIALIZER {-1,-1}
+
 /**
  * @returns true if \p PID is valid
  */
 #define rd_kafka_pid_valid(PID) ((PID).id != -1)
+
+/**
+ * @brief Check two pids for equality
+ */
+static RD_UNUSED RD_INLINE int rd_kafka_pid_eq (const rd_kafka_pid_t a,
+                                                const rd_kafka_pid_t b) {
+        return a.id == b.id && a.epoch == b.epoch;
+}
 
 /**
  * @returns the string representation of a PID in a thread-safe
@@ -295,7 +305,7 @@ struct rd_kafka_s {
                 rd_ts_t ts_idemp_state; /**< Last state change */
 
                 rd_kafka_pid_t pid;  /**< Current Producer ID and Epoch */
-                rd_kafka_timer_t get_pid_tmr; /**< Timer for pid retrieval */
+                rd_kafka_timer_t request_pid_tmr; /**< Timer for pid retrieval */
 
                 rd_kafkap_str_t *transactional_id; /**< Transactional Id,
                                                     *   a null string. */
