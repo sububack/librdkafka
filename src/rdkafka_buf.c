@@ -51,6 +51,11 @@ void rd_kafka_buf_destroy_final (rd_kafka_buf_t *rkbuf) {
                         mtx_unlock(rkbuf->rkbuf_u.Metadata.decr_lock);
                 }
                 break;
+
+        case RD_KAFKAP_Produce:
+                if (rkbuf->rkbuf_u.Produce.s_rktp)
+                        rd_kafka_toppar_destroy(rkbuf->rkbuf_u.Produce.s_rktp);
+                break;
         }
 
         if (rkbuf->rkbuf_response)
@@ -281,30 +286,32 @@ void rd_kafka_bufq_connection_reset (rd_kafka_broker_t *rkb,
 
 
 void rd_kafka_bufq_dump (rd_kafka_broker_t *rkb, const char *fac,
-			 rd_kafka_bufq_t *rkbq) {
-	rd_kafka_buf_t *rkbuf;
-	int cnt = rd_kafka_bufq_cnt(rkbq);
-	rd_ts_t now;
+                         rd_kafka_bufq_t *rkbq) {
+        rd_kafka_buf_t *rkbuf;
+        int cnt = rd_kafka_bufq_cnt(rkbq);
+        rd_ts_t now;
 
-	if (!cnt)
-		return;
+        if (!cnt)
+                return;
 
-	now = rd_clock();
+        now = rd_clock();
 
-	rd_rkb_dbg(rkb, BROKER, fac, "bufq with %d buffer(s):", cnt);
+        rd_rkb_dbg(rkb, BROKER, fac, "bufq with %d buffer(s):", cnt);
 
-	TAILQ_FOREACH(rkbuf, &rkbq->rkbq_bufs, rkbuf_link) {
-		rd_rkb_dbg(rkb, BROKER, fac,
-			   " Buffer %s (%"PRIusz" bytes, corrid %"PRId32", "
-			   "connid %d, retry %d in %lldms, timeout in %lldms",
-			   rd_kafka_ApiKey2str(rkbuf->rkbuf_reqhdr.ApiKey),
-			   rkbuf->rkbuf_totlen, rkbuf->rkbuf_corrid,
-			   rkbuf->rkbuf_connid, rkbuf->rkbuf_retries,
-			   rkbuf->rkbuf_ts_retry ?
-			   (now - rkbuf->rkbuf_ts_retry) / 1000LL : 0,
-			   rkbuf->rkbuf_ts_timeout ?
-			   (now - rkbuf->rkbuf_ts_timeout) / 1000LL : 0);
-	}
+        TAILQ_FOREACH(rkbuf, &rkbq->rkbq_bufs, rkbuf_link) {
+                rd_rkb_dbg(rkb, BROKER, fac,
+                           " Buffer %s (%"PRIusz" bytes, corrid %"PRId32", "
+                           "connid %d, prio %d, retry %d in %lldms, "
+                           "timeout in %lldms)",
+                           rd_kafka_ApiKey2str(rkbuf->rkbuf_reqhdr.ApiKey),
+                           rkbuf->rkbuf_totlen, rkbuf->rkbuf_corrid,
+                           rkbuf->rkbuf_connid, rkbuf->rkbuf_prio,
+                           rkbuf->rkbuf_retries,
+                           rkbuf->rkbuf_ts_retry ?
+                           (rkbuf->rkbuf_ts_retry - now) / 1000LL : 0,
+                           rkbuf->rkbuf_ts_timeout ?
+                           (rkbuf->rkbuf_ts_timeout - now) / 1000LL : 0);
+        }
 }
 
 
@@ -320,13 +327,16 @@ void rd_kafka_buf_calc_timeout (const rd_kafka_t *rk, rd_kafka_buf_t *rkbuf,
                  * Relative timeout, set request timeout to
                  * to now + rel timeout. */
                 rkbuf->rkbuf_ts_timeout = now + rkbuf->rkbuf_rel_timeout * 1000;
-        } else {
+        } else if (!rkbuf->rkbuf_force_timeout) {
                 /* Use absolute timeout, limited by socket.timeout.ms */
                 rd_ts_t sock_timeout = now +
                         rk->rk_conf.socket_timeout_ms * 1000;
 
                 rkbuf->rkbuf_ts_timeout =
                         RD_MIN(sock_timeout, rkbuf->rkbuf_abs_timeout);
+        } else {
+                /* Use absolue timeout without limit. */
+                rkbuf->rkbuf_ts_timeout = rkbuf->rkbuf_abs_timeout;
         }
 }
 

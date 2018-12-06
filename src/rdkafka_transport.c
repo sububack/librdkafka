@@ -66,7 +66,7 @@
 #endif
 
 
-#if WITH_SSL
+#if WITH_SSL && OPENSSL_VERSION_NUMBER < 0x10100000L
 static mtx_t *rd_kafka_ssl_locks;
 static int    rd_kafka_ssl_locks_cnt;
 #endif
@@ -446,7 +446,7 @@ static char *rd_kafka_ssl_error (rd_kafka_t *rk, rd_kafka_broker_t *rkb,
     return errstr;
 }
 
-
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
 static RD_UNUSED void
 rd_kafka_transport_ssl_lock_cb (int mode, int i, const char *file, int line) {
 	if (mode & CRYPTO_LOCK)
@@ -454,6 +454,7 @@ rd_kafka_transport_ssl_lock_cb (int mode, int i, const char *file, int line) {
 	else
 		mtx_unlock(&rd_kafka_ssl_locks[i]);
 }
+#endif
 
 static RD_UNUSED unsigned long rd_kafka_transport_ssl_threadid_cb (void) {
 #ifdef _MSC_VER
@@ -466,22 +467,36 @@ static RD_UNUSED unsigned long rd_kafka_transport_ssl_threadid_cb (void) {
 #endif
 }
 
+#ifdef HAVE_OPENSSL_CRYPTO_THREADID_SET_CALLBACK
+static void rd_kafka_transport_libcrypto_THREADID_callback(CRYPTO_THREADID *id)
+{
+    unsigned long thread_id = rd_kafka_transport_ssl_threadid_cb();
+
+    CRYPTO_THREADID_set_numeric(id, thread_id);
+}
+#endif
 
 /**
  * Global OpenSSL cleanup.
  */
 void rd_kafka_transport_ssl_term (void) {
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
 	int i;
 
-	CRYPTO_set_id_callback(NULL);
-	CRYPTO_set_locking_callback(NULL);
-        CRYPTO_cleanup_all_ex_data();
+	if (CRYPTO_get_locking_callback() == &rd_kafka_transport_ssl_lock_cb) {
+		CRYPTO_set_locking_callback(NULL);
+#ifdef HAVE_OPENSSL_CRYPTO_THREADID_SET_CALLBACK
+		CRYPTO_THREADID_set_callback(NULL);
+#else
+		CRYPTO_set_id_callback(NULL);
+#endif
 
-	for (i = 0 ; i < rd_kafka_ssl_locks_cnt ; i++)
-		mtx_destroy(&rd_kafka_ssl_locks[i]);
+		for (i = 0 ; i < rd_kafka_ssl_locks_cnt ; i++)
+			mtx_destroy(&rd_kafka_ssl_locks[i]);
 
-	rd_free(rd_kafka_ssl_locks);
-
+		rd_free(rd_kafka_ssl_locks);
+	}
+#endif
 }
 
 
@@ -489,20 +504,36 @@ void rd_kafka_transport_ssl_term (void) {
  * Global OpenSSL init.
  */
 void rd_kafka_transport_ssl_init (void) {
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
 	int i;
 	
-	rd_kafka_ssl_locks_cnt = CRYPTO_num_locks();
-	rd_kafka_ssl_locks = rd_malloc(rd_kafka_ssl_locks_cnt *
-				       sizeof(*rd_kafka_ssl_locks));
-	for (i = 0 ; i < rd_kafka_ssl_locks_cnt ; i++)
-		mtx_init(&rd_kafka_ssl_locks[i], mtx_plain);
+	if (!CRYPTO_get_locking_callback()) {
+		rd_kafka_ssl_locks_cnt = CRYPTO_num_locks();
+		rd_kafka_ssl_locks = rd_malloc(rd_kafka_ssl_locks_cnt *
+				               sizeof(*rd_kafka_ssl_locks));
+		for (i = 0 ; i < rd_kafka_ssl_locks_cnt ; i++)
+			mtx_init(&rd_kafka_ssl_locks[i], mtx_plain);
 
-	CRYPTO_set_id_callback(rd_kafka_transport_ssl_threadid_cb);
-	CRYPTO_set_locking_callback(rd_kafka_transport_ssl_lock_cb);
-	
+		CRYPTO_set_locking_callback(rd_kafka_transport_ssl_lock_cb);
+
+#ifdef HAVE_OPENSSL_CRYPTO_THREADID_SET_CALLBACK
+		CRYPTO_THREADID_set_callback(rd_kafka_transport_libcrypto_THREADID_callback);
+#else
+		CRYPTO_set_id_callback(rd_kafka_transport_ssl_threadid_cb);
+#endif
+	}
+
+        /* OPENSSL_init_ssl(3) and OPENSSL_init_crypto(3) say:
+         * "As of version 1.1.0 OpenSSL will automatically allocate
+         * all resources that it needs so no explicit initialisation
+         * is required. Similarly it will also automatically
+         * deinitialise as required."
+         */
 	SSL_load_error_strings();
 	SSL_library_init();
 	OpenSSL_add_all_algorithms();
+#endif
+
 }
 
 
@@ -1412,6 +1443,16 @@ static void rd_kafka_transport_io_event (rd_kafka_transport_t *rktrans,
 					     errstr);
 			return;
 		}
+
+		if (events & POLLHUP) {
+			errno = EINVAL;
+			rd_kafka_broker_fail(rkb, LOG_ERR,
+					     RD_KAFKA_RESP_ERR__AUTHENTICATION,
+					     "Disconnected");
+
+			return;
+		}
+
 		break;
 
 	case RD_KAFKA_BROKER_STATE_APIVERSION_QUERY:
@@ -1444,6 +1485,7 @@ static void rd_kafka_transport_io_event (rd_kafka_transport_t *rktrans,
 
 	case RD_KAFKA_BROKER_STATE_INIT:
 	case RD_KAFKA_BROKER_STATE_DOWN:
+        case RD_KAFKA_BROKER_STATE_TRY_CONNECT:
 		rd_kafka_assert(rkb->rkb_rk, !*"bad state");
 	}
 }
@@ -1459,9 +1501,10 @@ void rd_kafka_transport_io_serve (rd_kafka_transport_t *rktrans,
 	rd_kafka_broker_t *rkb = rktrans->rktrans_rkb;
 	int events;
 
-	if (rd_kafka_bufq_cnt(&rkb->rkb_waitresps) < rkb->rkb_max_inflight &&
-	    rd_kafka_bufq_cnt(&rkb->rkb_outbufs) > 0)
-		rd_kafka_transport_poll_set(rkb->rkb_transport, POLLOUT);
+        if (rkb->rkb_state > RD_KAFKA_BROKER_STATE_CONNECT &&
+            rd_kafka_bufq_cnt(&rkb->rkb_waitresps) < rkb->rkb_max_inflight &&
+            rd_kafka_bufq_cnt(&rkb->rkb_outbufs) > 0)
+                rd_kafka_transport_poll_set(rkb->rkb_transport, POLLOUT);
 
 	if ((events = rd_kafka_transport_poll(rktrans, timeout_ms)) <= 0)
                 return;
@@ -1636,11 +1679,10 @@ int rd_kafka_transport_poll(rd_kafka_transport_t *rktrans, int tmout) {
 
         if (rktrans->rktrans_pfd[1].revents & POLLIN) {
                 /* Read wake-up fd data and throw away, just used for wake-ups*/
-                char buf[512];
-                if (rd_read((int)rktrans->rktrans_pfd[1].fd,
-                            buf, sizeof(buf)) == -1) {
-                        /* Ignore warning */
-                }
+                char buf[1024];
+                while (rd_read((int)rktrans->rktrans_pfd[1].fd,
+                               buf, sizeof(buf)) > 0)
+                        ; /* Read all buffered signalling bytes */
         }
 
         return rktrans->rktrans_pfd[0].revents;

@@ -77,15 +77,22 @@ set(
     0082-fetch_max_bytes.cpp
     0083-cb_event.c
     0084-destroy_flags.c
+    0085-headers.cpp
+    0086-purge.c
+    0088-produce_metadata_timeout.c
+    0089-max_poll_interval.c
+    0090-idempotence.c
+    0091-max_poll_interval_timeout.c
+    0092-mixed_msgver.c
     8000-idle.cpp
     test.c
-    testcpp.cpp    
+    testcpp.cpp
 )
 
 if(NOT WIN32)
-    list(APPEND sources sockem.c)
+    list(APPEND sources sockem.c sockem_ctrl.c)
 else()
-    list(APPEND sources ../src/tinycthread.c)
+    list(APPEND sources ../src/tinycthread.c ../src/tinycthread_extra.c)
 endif()
 
 add_executable(rdkafka_test ${sources})

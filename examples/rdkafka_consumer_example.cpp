@@ -97,10 +97,12 @@ class ExampleEventCb : public RdKafka::EventCb {
     switch (event.type())
     {
       case RdKafka::Event::EVENT_ERROR:
+        if (event.fatal()) {
+          std::cerr << "FATAL ";
+          run = false;
+        }
         std::cerr << "ERROR (" << RdKafka::err2str(event.err()) << "): " <<
             event.str() << std::endl;
-        if (event.err() == RdKafka::ERR__ALL_BROKERS_DOWN)
-          run = false;
         break;
 
       case RdKafka::Event::EVENT_STATS:
@@ -228,6 +230,8 @@ int main (int argc, char **argv) {
 
   ExampleRebalanceCb ex_rebalance_cb;
   conf->set("rebalance_cb", &ex_rebalance_cb, errstr);
+
+  conf->set("enable.partition.eof", "true", errstr);
 
   while ((opt = getopt(argc, argv, "g:b:z:qd:eX:AM:qv")) != -1) {
     switch (opt) {

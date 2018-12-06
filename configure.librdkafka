@@ -41,7 +41,28 @@ function checks {
     # -lrt is needed on linux for clock_gettime: link it if it exists.
     mkl_lib_check "librt" "" cont CC "-lrt"
 
-    # required libs
+
+    # Use internal tinycthread if C11 threads not avaialable
+    mkl_lib_check "c11threads" WITH_C11THREADS disable CC "" \
+                  "
+#include <threads.h>
+
+
+static int start_func (void *arg) {
+   int iarg = *(int *)arg;
+   return iarg;
+}
+
+void foo (void) {
+    thrd_t thr;
+    int arg = 1;
+    if (thrd_create(&thr, start_func, (void *)&arg) != thrd_success) {
+      ;
+    }
+}
+"
+
+    # pthreads required (even if C11 threads available) for rwlocks
     mkl_lib_check "libpthread" "" fail CC "-lpthread" \
                   "#include <pthread.h>"
 
@@ -62,10 +83,28 @@ void foo (void) {
         mkl_allvar_set WITH_PLUGINS WITH_PLUGINS y
     fi
 
+    if [[ $MKL_DISTRO == "osx" ]]; then
+        # Add brew's OpenSSL pkg-config path on OSX
+        # to avoid picking up the outdated system-provided openssl / libcrypto.
+        export PKG_CONFIG_PATH="$PKG_CONFIG_PATH:/usr/local/opt/openssl/lib/pkgconfig"
+    fi
+
+
     # optional libs
     mkl_lib_check "zlib" "WITH_ZLIB" disable CC "-lz" \
                   "#include <zlib.h>"
     mkl_lib_check "libcrypto" "" disable CC "-lcrypto"
+    mkl_meta_set "zstd" "deb" "libzstd-dev"
+    mkl_meta_set "zstd" "brew" "zstd"
+    mkl_lib_check --static=-lzstd "libzstd" "WITH_ZSTD" disable CC "-lzstd" \
+                  "
+#include <zstd.h>
+#include <zstd_errors.h>
+
+void foo (void) {
+     ZSTD_getFrameContentSize(NULL, 0);
+}
+"
 
     if mkl_lib_check "libm" "" disable CC "-lm" \
                      "#include <math.h>"; then
@@ -90,10 +129,6 @@ void foo (void) {
 
     if [[ "$ENABLE_SSL" == "y" ]]; then
 	mkl_meta_set "libssl" "deb" "libssl-dev"
-        if [[ $MKL_DISTRO == "osx" ]]; then
-            # Add brew's OpenSSL pkg-config path on OSX
-            export PKG_CONFIG_PATH="$PKG_CONFIG_PATH:/usr/local/opt/openssl/lib/pkgconfig"
-        fi
 	mkl_lib_check "libssl" "WITH_SSL" disable CC "-lssl" \
                       "#include <openssl/ssl.h>"
     fi

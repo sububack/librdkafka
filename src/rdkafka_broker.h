@@ -87,6 +87,7 @@ struct rd_kafka_broker_s { /* rd_kafka_broker_t */
 	enum {
 		RD_KAFKA_BROKER_STATE_INIT,
 		RD_KAFKA_BROKER_STATE_DOWN,
+                RD_KAFKA_BROKER_STATE_TRY_CONNECT,
 		RD_KAFKA_BROKER_STATE_CONNECT,
 		RD_KAFKA_BROKER_STATE_AUTH,
 
@@ -131,13 +132,13 @@ struct rd_kafka_broker_s { /* rd_kafka_broker_t */
 	rd_kafka_confsource_t  rkb_source;
 	struct {
 		rd_atomic64_t tx_bytes;
-		rd_atomic64_t tx;    /* Kafka-messages (not payload msgs) */
+		rd_atomic64_t tx;            /**< Kafka requests */
 		rd_atomic64_t tx_err;
 		rd_atomic64_t tx_retries;
 		rd_atomic64_t req_timeouts;  /* Accumulated value */
 
 		rd_atomic64_t rx_bytes;
-		rd_atomic64_t rx;    /* Kafka messages (not payload msgs) */
+		rd_atomic64_t rx;            /**< Kafka responses */
 		rd_atomic64_t rx_err;
 		rd_atomic64_t rx_corrid_err; /* CorrId misses */
 		rd_atomic64_t rx_partial;    /* Partial messages received
@@ -145,6 +146,15 @@ struct rd_kafka_broker_s { /* rd_kafka_broker_t */
                 rd_atomic64_t zbuf_grow;     /* Compression/decompression buffer grows needed */
                 rd_atomic64_t buf_grow;      /* rkbuf grows needed */
                 rd_atomic64_t wakeups;       /* Poll wakeups */
+
+                rd_atomic32_t connects;      /**< Connection attempts,
+                                              *   successful or not. */
+
+                rd_atomic32_t disconnects;   /**< Disconnects.
+                                              *   Always peer-triggered. */
+
+                rd_atomic64_t reqtype[RD_KAFKAP__NUM]; /**< Per request-type
+                                                        *   counter */
 	} rkb_c;
 
         int                 rkb_req_timeouts;  /* Current value */
@@ -196,7 +206,38 @@ struct rd_kafka_broker_s { /* rd_kafka_broker_t */
         int                 rkb_toppar_wakeup_fd; /* Toppar msgq wakeup fd,
                                                    * this is rkb_wakeup_fd[1]
                                                    * if enabled. */
-        rd_interval_t       rkb_connect_intvl;    /* Reconnect throttling */
+
+        /**< Current, exponentially increased, reconnect backoff. */
+        int                 rkb_reconnect_backoff_ms;
+
+        /**< Absolute timestamp of next allowed reconnect. */
+        rd_ts_t             rkb_ts_reconnect;
+
+        /**< Persistent connection demand is tracked by
+         *   an counter for each type of demand.
+         *   The broker thread will maintain a persistent connection
+         *   if any of the counters are non-zero, and revert to
+         *   on-demand mode when they all reach zero.
+         *   After incrementing any of the counters a broker wakeup
+         *   should be signalled to expedite handling. */
+        struct {
+                /**< Producer: partitions are being produced to.
+                 *   Consumer: partitions are being fetched from.
+                 *
+                 *   Counter is maintained by the broker handler thread
+                 *   itself, no need for atomic/locking.
+                 *   Is reset to 0 on each producer|consumer_serve() loop
+                 *   and updated according to current need, which
+                 *   will trigger a state transition to
+                 *   TRY_CONNECT if a connection is needed. */
+                int internal;
+
+                /**< Consumer: Broker is the group coordinator.
+                 *
+                 *   Counter is maintained by cgrp logic in
+                 *   rdkafka main thread. */
+                rd_atomic32_t coord;
+        } rkb_persistconn;
 
 	rd_kafka_secproto_t rkb_proto;
 
@@ -205,6 +246,17 @@ struct rd_kafka_broker_s { /* rd_kafka_broker_t */
 	rd_kafka_timer_t    rkb_sasl_kinit_refresh_tmr;
 #endif
 
+
+        /*
+         * Log suppression
+         */
+        struct {
+                /**< Log: compression type not supported by broker. */
+                rd_interval_t unsupported_compression;
+
+                /**< Log: KIP-62 not supported by broker. */
+                rd_interval_t unsupported_kip62;
+        } rkb_suppress;
 
 	struct {
 		char msg[512];
@@ -216,6 +268,13 @@ struct rd_kafka_broker_s { /* rd_kafka_broker_t */
 #define rd_kafka_broker_lock(rkb)   mtx_lock(&(rkb)->rkb_lock)
 #define rd_kafka_broker_unlock(rkb) mtx_unlock(&(rkb)->rkb_lock)
 
+
+/**
+ * @returns true if the broker state is UP or UPDATE
+ */
+#define rd_kafka_broker_state_is_up(state)              \
+        ((state) == RD_KAFKA_BROKER_STATE_UP ||         \
+         (state) == RD_KAFKA_BROKER_STATE_UPDATE)
 
 /**
  * @brief Broker comparator
@@ -246,13 +305,12 @@ int16_t rd_kafka_broker_ApiVersion_supported (rd_kafka_broker_t *rkb,
 
 int rd_kafka_broker_get_state (rd_kafka_broker_t *rkb);
 
-rd_kafka_broker_t *rd_kafka_broker_find_by_nodeid (rd_kafka_t *rk,
-						   int32_t nodeid);
 rd_kafka_broker_t *rd_kafka_broker_find_by_nodeid0 (rd_kafka_t *rk,
                                                     int32_t nodeid,
-                                                    int state);
+                                                    int state,
+                                                    rd_bool_t do_connect);
 #define rd_kafka_broker_find_by_nodeid(rk,nodeid) \
-        rd_kafka_broker_find_by_nodeid0(rk,nodeid,-1)
+        rd_kafka_broker_find_by_nodeid0(rk,nodeid,-1,rd_false)
 
 /**
  * Filter out brokers that are currently in a blocking request.
@@ -261,6 +319,16 @@ static RD_INLINE RD_UNUSED int
 rd_kafka_broker_filter_non_blocking (rd_kafka_broker_t *rkb, void *opaque) {
         return rd_atomic32_get(&rkb->rkb_blocking_request_cnt) > 0;
 }
+
+
+/**
+ * Filter out brokers that don't support Idempotent Producer.
+ */
+static RD_INLINE RD_UNUSED int
+rd_kafka_broker_filter_non_idempotent (rd_kafka_broker_t *rkb, void *opaque) {
+        return !(rkb->rkb_features & RD_KAFKA_FEATURE_IDEMPOTENT_PRODUCER);
+}
+
 
 /**
  * Filter out brokers that cant do GroupCoordinator requests right now.
@@ -274,12 +342,13 @@ rd_kafka_broker_filter_can_group_query (rd_kafka_broker_t *rkb, void *opaque) {
 rd_kafka_broker_t *rd_kafka_broker_any (rd_kafka_t *rk, int state,
                                         int (*filter) (rd_kafka_broker_t *rkb,
                                                        void *opaque),
-                                        void *opaque);
+                                        void *opaque, const char *reason);
 
 rd_kafka_broker_t *rd_kafka_broker_any_usable (rd_kafka_t *rk, int timeout_ms,
-                                               int do_lock);
+                                               int do_lock, const char *reason);
 
-rd_kafka_broker_t *rd_kafka_broker_prefer (rd_kafka_t *rk, int32_t broker_id, int state);
+rd_kafka_broker_t *rd_kafka_broker_prefer (rd_kafka_t *rk, int32_t broker_id,
+                                           int state);
 
 rd_kafka_broker_t *
 rd_kafka_broker_get_async (rd_kafka_t *rk, int32_t broker_id, int state,
@@ -326,6 +395,10 @@ int rd_kafka_recv (rd_kafka_broker_t *rkb);
 void rd_kafka_dr_msgq (rd_kafka_itopic_t *rkt,
 		       rd_kafka_msgq_t *rkmq, rd_kafka_resp_err_t err);
 
+void rd_kafka_dr_implicit_ack (rd_kafka_broker_t *rkb,
+                               rd_kafka_toppar_t *rktp,
+                               uint64_t last_msgid);
+
 void rd_kafka_broker_buf_enq1 (rd_kafka_broker_t *rkb,
                                rd_kafka_buf_t *rkbuf,
                                rd_kafka_resp_cb_t *resp_cb,
@@ -348,6 +421,13 @@ void msghdr_print (rd_kafka_t *rk,
 
 const char *rd_kafka_broker_name (rd_kafka_broker_t *rkb);
 void rd_kafka_broker_wakeup (rd_kafka_broker_t *rkb);
+int rd_kafka_all_brokers_wakeup (rd_kafka_t *rk,
+                                 int min_state);
+
+void rd_kafka_connect_any (rd_kafka_t *rk, const char *reason);
+
+void rd_kafka_broker_purge_queues (rd_kafka_broker_t *rkb, int purge_flags,
+                                   rd_kafka_replyq_t replyq);
 
 int rd_kafka_brokers_get_state_version (rd_kafka_t *rk);
 int rd_kafka_brokers_wait_state_change (rd_kafka_t *rk, int stored_version,
@@ -381,5 +461,19 @@ void rd_kafka_broker_active_toppar_add (rd_kafka_broker_t *rkb,
 
 void rd_kafka_broker_active_toppar_del (rd_kafka_broker_t *rkb,
                                         rd_kafka_toppar_t *rktp);
+
+
+void rd_kafka_broker_schedule_connection (rd_kafka_broker_t *rkb);
+
+void
+rd_kafka_broker_persistent_connection_add (rd_kafka_broker_t *rkb,
+                                           rd_atomic32_t *acntp);
+
+void
+rd_kafka_broker_persistent_connection_del (rd_kafka_broker_t *rkb,
+                                           rd_atomic32_t *acntp);
+
+
+int unittest_broker (void);
 
 #endif /* _RDKAFKA_BROKER_H_ */

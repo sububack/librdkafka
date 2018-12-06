@@ -68,6 +68,7 @@ extern double test_timeout_multiplier;
 extern int  test_session_timeout_ms; /* Group session timeout */
 extern int  test_flags;
 extern int  test_neg_flags;
+extern int  test_idempotent_producer;
 
 extern mtx_t test_mtx;
 
@@ -114,6 +115,8 @@ struct test {
 	int report_size;
 
         rd_kafka_resp_err_t exp_dr_err; /* Expected error in test_dr_cb */
+        rd_kafka_msg_status_t exp_dr_status; /**< Expected delivery status,
+                                              *   or -1 for not checking. */
         int produce_sync;    /**< test_produce_sync() call in action */
         rd_kafka_resp_err_t produce_sync_err;  /**< DR error */
 
@@ -214,6 +217,16 @@ void test_fail0 (const char *file, int line, const char *function,
                       TEST_FAIL("Test assertion failed: \"" # expr  "\": " \
                                 __VA_ARGS__);                           \
                       }                                                 \
+        } while (0)
+
+
+/* "..." is a failure reason in printf format, include as much info as needed */
+#define TEST_ASSERT_LATER(expr,...) do {                                \
+                if (!(expr)) {                                          \
+                        TEST_FAIL0(__FILE__, __LINE__, 1, 0,            \
+                                   "Test assertion failed: \"" # expr  "\": " \
+                                   __VA_ARGS__);                        \
+                }                                                       \
         } while (0)
 
 /* Skip the current test. Argument is textual reason (printf format) */
@@ -405,8 +418,8 @@ rd_kafka_t *test_create_handle (int mode, rd_kafka_conf_t *conf);
  * Delivery reported callback.
  * Called for each message once to signal its delivery status.
  */
-void test_dr_cb (rd_kafka_t *rk, void *payload, size_t len,
-                 rd_kafka_resp_err_t err, void *opaque, void *msg_opaque);
+void test_dr_msg_cb (rd_kafka_t *rk,
+                     const rd_kafka_message_t *rkmessage, void *opaque);
 
 rd_kafka_t *test_create_producer (void);
 rd_kafka_topic_t *test_create_producer_topic(rd_kafka_t *rk,
@@ -462,6 +475,7 @@ void test_consumer_subscribe (rd_kafka_t *rk, const char *topic);
 
 void
 test_consume_msgs_easy_mv (const char *group_id, const char *topic,
+                           int32_t partition,
                            uint64_t testid, int exp_eofcnt, int exp_msgcnt,
                            rd_kafka_topic_conf_t *tconf,
                            test_msgver_t *mv);
@@ -529,6 +543,7 @@ void test_prepare_msg (uint64_t testid, int32_t partition, int msg_id,
 void test_socket_enable (rd_kafka_conf_t *conf);
 void test_socket_close_all (struct test *test, int reinit);
 int  test_socket_sockem_set_all (const char *key, int val);
+void test_socket_sockem_set (int s, const char *key, int value);
 #endif
 
 void test_headers_dump (const char *what, int lvl,
@@ -551,6 +566,7 @@ test_wait_admin_result (rd_kafka_queue_t *q,
 rd_kafka_resp_err_t
 test_wait_topic_admin_result (rd_kafka_queue_t *q,
                               rd_kafka_event_type_t evtype,
+                              rd_kafka_event_t **retevent,
                               int tmout);
 
 rd_kafka_resp_err_t
@@ -571,6 +587,12 @@ test_DeleteTopics_simple (rd_kafka_t *rk,
                           rd_kafka_queue_t *useq,
                           char **topics, size_t topic_cnt,
                           void *opaque);
+
+rd_kafka_resp_err_t
+test_AlterConfigs_simple (rd_kafka_t *rk,
+                          rd_kafka_ResourceType_t restype,
+                          const char *resname,
+                          const char **configs, size_t config_cnt);
 
 rd_kafka_resp_err_t test_delete_all_test_topics (int timeout_ms);
 

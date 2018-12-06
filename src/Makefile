@@ -13,6 +13,7 @@ SRCS_$(WITH_SASL_CYRUS) += rdkafka_sasl_cyrus.c
 SRCS_$(WITH_SASL_SCRAM) += rdkafka_sasl_scram.c
 SRCS_$(WITH_SNAPPY) += snappy.c
 SRCS_$(WITH_ZLIB) += rdgz.c
+SRCS_$(WITH_ZSTD) += rdkafka_zstd.c
 SRCS_$(WITH_HDRHISTOGRAM) += rdhdrhistogram.c
 
 SRCS_LZ4 = xxhash.c
@@ -36,13 +37,14 @@ SRCS=		rdkafka.c rdkafka_broker.c rdkafka_msg.c rdkafka_topic.c \
 		rdkafka_partition.c rdkafka_subscription.c \
 		rdkafka_assignor.c rdkafka_range_assignor.c \
 		rdkafka_roundrobin_assignor.c rdkafka_feature.c \
-		rdcrc32.c crc32c.c rdmurmur2.c rdaddr.c rdrand.c rdlist.c tinycthread.c \
+		rdcrc32.c crc32c.c rdmurmur2.c rdaddr.c rdrand.c rdlist.c \
+		tinycthread.c tinycthread_extra.c \
 		rdlog.c rdstring.c rdkafka_event.c rdkafka_metadata.c \
 		rdregex.c rdports.c rdkafka_metadata_cache.c rdavl.c \
 		rdkafka_sasl.c rdkafka_sasl_plain.c rdkafka_interceptor.c \
 		rdkafka_msgset_writer.c rdkafka_msgset_reader.c \
 		rdkafka_header.c rdkafka_admin.c rdkafka_aux.c \
-		rdkafka_background.c \
+		rdkafka_background.c rdkafka_idempotence.c \
 		rdvarint.c rdbuf.c rdunittest.c \
 		$(SRCS_y)
 

@@ -26,6 +26,10 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
+#ifdef _MSC_VER
+#define RD_UNITTEST_QPC_OVERRIDES 1
+#endif
+
 #include "rd.h"
 #include "rdunittest.h"
 
@@ -37,8 +41,12 @@
 #include "rdhdrhistogram.h"
 #endif
 #include "rdkafka_int.h"
+#include "rdkafka_broker.h"
 
 #include "rdsysqueue.h"
+
+
+int rd_unittest_assert_on_failure = 0;
 
 
 /**
@@ -313,6 +321,70 @@ static int unittest_sysqueue (void) {
 /**@}*/
 
 
+/**
+ * @name rd_clock() unittests
+ * @{
+ */
+
+#if RD_UNITTEST_QPC_OVERRIDES
+
+/**
+ * These values are based off a machine with freq 14318180
+ * which would cause the original rd_clock() calculation to overflow
+ * after about 8 days.
+ * Details:
+ * https://github.com/confluentinc/confluent-kafka-dotnet/issues/603#issuecomment-417274540
+ */
+
+static const int64_t rd_ut_qpc_freq = 14318180;
+static int64_t rd_ut_qpc_now;
+
+BOOL rd_ut_QueryPerformanceFrequency(_Out_ LARGE_INTEGER * lpFrequency) {
+        lpFrequency->QuadPart = rd_ut_qpc_freq;
+        return TRUE;
+}
+
+BOOL rd_ut_QueryPerformanceCounter(_Out_ LARGE_INTEGER * lpPerformanceCount) {
+        lpPerformanceCount->QuadPart = rd_ut_qpc_now * rd_ut_qpc_freq;
+        return TRUE;
+}
+
+static int unittest_rdclock (void) {
+        rd_ts_t t1, t2;
+
+        /* First let "uptime" be fresh boot (0). */
+        rd_ut_qpc_now = 0;
+        t1 = rd_clock();
+        rd_ut_qpc_now++;
+        t2 = rd_clock();
+        RD_UT_ASSERT(t2 == t1 + (1 * 1000000),
+                     "Expected t2 %"PRId64" to be 1s more than t1 %"PRId64,
+                     t2, t1);
+
+        /* Then skip forward to 8 days, which should trigger the
+         * overflow in a faulty implementation. */
+        rd_ut_qpc_now = 8 * 86400;
+        t2 = rd_clock();
+        RD_UT_ASSERT(t2 == t1 + (8LL * 86400 * 1000000),
+                     "Expected t2 %"PRId64" to be 8 days larger than t1 %"PRId64,
+                     t2, t1);
+
+        /* And make sure we can run on a system with 38 years of uptime.. */
+        rd_ut_qpc_now = 38 * 365 * 86400;
+        t2 = rd_clock();
+        RD_UT_ASSERT(t2 == t1 + (38LL * 365 * 86400 * 1000000),
+                     "Expected t2 %"PRId64" to be 38 years larger than t1 %"PRId64,
+                     t2, t1);
+
+        RD_UT_PASS();
+}
+#endif
+
+
+
+/**@}*/
+
+
 int rd_unittest (void) {
         int fails = 0;
         const struct {
@@ -328,9 +400,19 @@ int rd_unittest (void) {
 #if WITH_HDRHISTOGRAM
                 { "rdhdrhistogram", unittest_rdhdrhistogram },
 #endif
+#ifdef _MSC_VER
+                { "rdclock", unittest_rdclock },
+#endif
+                { "conf", unittest_conf },
+                { "broker", unittest_broker },
                 { NULL }
         };
         int i;
+
+#ifndef _MSC_VER
+        if (getenv("RD_UT_ASSERT"))
+                rd_unittest_assert_on_failure = 1;
+#endif
 
         for (i = 0 ; unittests[i].name ; i++) {
                 int f = unittests[i].call();

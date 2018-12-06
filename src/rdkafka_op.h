@@ -62,12 +62,11 @@ typedef struct rd_kafka_replyq_s {
  *   - rd_kafka_buf_t.rkbuf_flags
  */
 #define RD_KAFKA_OP_F_FREE        0x1  /* rd_free payload when done with it */
-#define RD_KAFKA_OP_F_FLASH       0x2  /* Internal: insert at head of queue */
-#define RD_KAFKA_OP_F_NO_RESPONSE 0x4  /* rkbuf: Not expecting a response */
-#define RD_KAFKA_OP_F_CRC         0x8  /* rkbuf: Perform CRC calculation */
-#define RD_KAFKA_OP_F_BLOCKING    0x10 /* rkbuf: blocking protocol request */
-#define RD_KAFKA_OP_F_REPROCESS   0x20 /* cgrp: Reprocess at a later time. */
-#define RD_KAFKA_OP_F_SENT        0x80 /* rkbuf: request sent on wire */
+#define RD_KAFKA_OP_F_NO_RESPONSE 0x2  /* rkbuf: Not expecting a response */
+#define RD_KAFKA_OP_F_CRC         0x4  /* rkbuf: Perform CRC calculation */
+#define RD_KAFKA_OP_F_BLOCKING    0x8  /* rkbuf: blocking protocol request */
+#define RD_KAFKA_OP_F_REPROCESS   0x10 /* cgrp: Reprocess at a later time. */
+#define RD_KAFKA_OP_F_SENT        0x20 /* rkbuf: request sent on wire */
 
 
 typedef enum {
@@ -118,6 +117,8 @@ typedef enum {
         RD_KAFKA_OP_ALTERCONFIGS,    /**< Admin: AlterConfigs: u.admin_request*/
         RD_KAFKA_OP_DESCRIBECONFIGS, /**< Admin: DescribeConfigs: u.admin_request*/
         RD_KAFKA_OP_ADMIN_RESULT,    /**< Admin API .._result_t */
+        RD_KAFKA_OP_PURGE,           /**< Purge queues */
+        RD_KAFKA_OP_CONNECT,         /**< Connect (to broker) */
         RD_KAFKA_OP__END
 } rd_kafka_op_type_t;
 
@@ -140,7 +141,7 @@ typedef enum {
                                      * still at some scale. e.g. logs, .. */
         RD_KAFKA_PRIO_HIGH,         /* Small scale high priority */
         RD_KAFKA_PRIO_FLASH         /* Micro scale, immediate delivery. */
-} rd_kafka_op_prio_t;
+} rd_kafka_prio_t;
 
 
 /**
@@ -210,8 +211,8 @@ struct rd_kafka_op_s {
 	rd_kafka_resp_err_t   rko_err;
 	int32_t               rko_len;    /* Depends on type, typically the
 					   * message length. */
-        rd_kafka_op_prio_t    rko_prio;   /* In-queue priority.
-                                           * Higher value means higher prio. */
+        rd_kafka_prio_t       rko_prio;   /**< In-queue priority.
+                                           *   Higher value means higher prio*/
 
 	shptr_rd_kafka_toppar_t *rko_rktp;
 
@@ -283,6 +284,9 @@ struct rd_kafka_op_s {
 			int64_t offset;
 			char *errstr;
 			rd_kafka_msg_t rkm;
+                        int fatal;  /**< This was a ERR__FATAL error that has
+                                     *   been translated to the fatal error
+                                     *   code. */
 		} err;  /* used for ERR and CONSUMER_ERR */
 
 		struct {
@@ -412,6 +416,10 @@ struct rd_kafka_op_s {
                                            *   rd_kafka_AdminOptions_set_opaque
                                            */
                 } admin_result;
+
+                struct {
+                        int flags; /**< purge_flags from rd_kafka_purge() */
+                } purge;
 	} rko_u;
 };
 

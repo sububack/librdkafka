@@ -65,6 +65,7 @@ static const char *test_git_version = "HEAD";
 static const char *test_sockem_conf = "";
 int          test_on_ci = 0; /* Tests are being run on CI, be more forgiving
                               * with regards to timeouts, etc. */
+int test_idempotent_producer = 0;
 static int show_summary = 1;
 static int test_summary (int do_lock);
 
@@ -72,6 +73,7 @@ static int test_summary (int do_lock);
  * Protects shared state, such as tests[]
  */
 mtx_t test_mtx;
+cnd_t test_cnd;
 
 static const char *test_states[] = {
         "DNS",
@@ -175,6 +177,14 @@ _TEST_DECL(0082_fetch_max_bytes);
 _TEST_DECL(0083_cb_event);
 _TEST_DECL(0084_destroy_flags_local);
 _TEST_DECL(0084_destroy_flags);
+_TEST_DECL(0085_headers);
+_TEST_DECL(0086_purge_local);
+_TEST_DECL(0086_purge_remote);
+_TEST_DECL(0088_produce_metadata_timeout);
+_TEST_DECL(0089_max_poll_interval);
+_TEST_DECL(0090_idempotence);
+_TEST_DECL(0091_max_poll_interval_timeout);
+_TEST_DECL(0092_mixed_msgver);
 
 /* Manual tests */
 _TEST_DECL(8000_idle);
@@ -283,6 +293,17 @@ struct test tests[] = {
         _TEST(0083_cb_event, 0, TEST_BRKVER(0,9,0,0)),
         _TEST(0084_destroy_flags_local, TEST_F_LOCAL),
         _TEST(0084_destroy_flags, 0),
+        _TEST(0085_headers, 0, TEST_BRKVER(0,11,0,0)),
+        _TEST(0086_purge_local, TEST_F_LOCAL),
+        _TEST(0086_purge_remote, 0),
+#if WITH_SOCKEM
+        _TEST(0088_produce_metadata_timeout, TEST_F_SOCKEM),
+#endif
+        _TEST(0089_max_poll_interval, 0, TEST_BRKVER(0,10,1,0)),
+        _TEST(0090_idempotence, 0, TEST_BRKVER(0,11,0,0)),
+        _TEST(0091_max_poll_interval_timeout, 0, TEST_BRKVER(0,10,1,0)),
+        _TEST(0092_mixed_msgver, 0, TEST_BRKVER(0,11,0,0)),
+
         /* Manual tests */
         _TEST(8000_idle, TEST_F_MANUAL),
 
@@ -333,6 +354,16 @@ int test_socket_sockem_set_all (const char *key, int val) {
         TEST_UNLOCK();
 
         return cnt;
+}
+
+void test_socket_sockem_set (int s, const char *key, int value) {
+        sockem_t *skm;
+
+        TEST_LOCK();
+        skm = sockem_find(s);
+        if (skm)
+                sockem_set(skm, key, value, NULL);
+        TEST_UNLOCK();
 }
 
 void test_socket_close_all (struct test *test, int reinit) {
@@ -397,12 +428,30 @@ void test_socket_enable (rd_kafka_conf_t *conf) {
 
 static void test_error_cb (rd_kafka_t *rk, int err,
 			   const char *reason, void *opaque) {
-        if (test_curr->is_fatal_cb && !test_curr->is_fatal_cb(rk, err, reason))
-                TEST_SAY(_C_YEL "rdkafka error (non-fatal): %s: %s\n",
+        if (test_curr->is_fatal_cb && !test_curr->is_fatal_cb(rk, err, reason)) {
+                TEST_SAY(_C_YEL "rdkafka error (non-testfatal): %s: %s\n",
                          rd_kafka_err2str(err), reason);
-        else
-                TEST_FAIL("rdkafka error: %s: %s",
-                          rd_kafka_err2str(err), reason);
+        } else {
+                if (err == RD_KAFKA_RESP_ERR__FATAL) {
+                        char errstr[512];
+                        TEST_SAY(_C_RED "Fatal error: %s\n", reason);
+
+                        err = rd_kafka_fatal_error(rk, errstr, sizeof(errstr));
+
+                        if (test_curr->is_fatal_cb &&
+                            !test_curr->is_fatal_cb(rk,  err, reason))
+                                TEST_SAY(_C_YEL "rdkafka ignored FATAL error: "
+                                         "%s: %s\n",
+                                         rd_kafka_err2str(err), errstr);
+                        else
+                                TEST_FAIL("rdkafka FATAL error: %s: %s",
+                                          rd_kafka_err2str(err), errstr);
+
+                } else {
+                        TEST_FAIL("rdkafka error: %s: %s",
+                                  rd_kafka_err2str(err), reason);
+                }
+        }
 }
 
 static int test_stats_cb (rd_kafka_t *rk, char *json, size_t json_len,
@@ -663,6 +712,8 @@ void test_conf_init (rd_kafka_conf_t **conf, rd_kafka_topic_conf_t **topic_conf,
         if (conf) {
                 *conf = rd_kafka_conf_new();
                 rd_kafka_conf_set(*conf, "client.id", test_curr->name, NULL, 0);
+                test_conf_set(*conf, "enable.idempotence",
+                              test_idempotent_producer ? "true" : "false");
                 rd_kafka_conf_set_error_cb(*conf, test_error_cb);
                 rd_kafka_conf_set_stats_cb(*conf, test_stats_cb);
 
@@ -857,6 +908,8 @@ static int run_test0 (struct run_args *run_args) {
 #if WITH_SOCKEM
         rd_list_init(&test->sockets, 16, (void *)sockem_close);
 #endif
+        /* Don't check message status by default */
+        test->exp_dr_status = (rd_kafka_msg_status_t)-1;
 
 	TEST_SAY("================= Running test %s =================\n",
 		 test->name);
@@ -888,6 +941,8 @@ static int run_test0 (struct run_args *run_args) {
                          run_args->test->name);
         }
         TEST_UNLOCK();
+
+        cnd_broadcast(&test_cnd);
 
 #if WITH_SOCKEM
         test_socket_close_all(test, 0);
@@ -944,14 +999,12 @@ static int run_test (struct test *test, int argc, char **argv) {
 
         TEST_LOCK();
         while (tests_running_cnt >= test_concurrent_max) {
-                if (!(wait_cnt++ % 10))
+                if (!(wait_cnt++ % 100))
                         TEST_SAY("Too many tests running (%d >= %d): "
                                  "postponing %s start...\n",
                                  tests_running_cnt, test_concurrent_max,
                                  test->name);
-                TEST_UNLOCK();
-                rd_sleep(1);
-                TEST_LOCK();
+                cnd_timedwait_ms(&test_cnd, &test_mtx, 100);
         }
         tests_running_cnt++;
         test->timeout = test_clock() + (int64_t)(20.0 * 1000000.0 *
@@ -1273,6 +1326,7 @@ int main(int argc, char **argv) {
 	int a,b,c,d;
 
 	mtx_init(&test_mtx, mtx_plain);
+        cnd_init(&test_cnd);
 
         test_init();
 
@@ -1311,6 +1365,8 @@ int main(int argc, char **argv) {
 			show_summary = 0;
                 else if (!strcmp(argv[i], "-D"))
                         test_delete_topics_between = 1;
+                else if (!strcmp(argv[i], "-P"))
+                        test_idempotent_producer = 1;
 		else if (*argv[i] != '-')
                         tests_to_run = argv[i];
                 else {
@@ -1326,6 +1382,7 @@ int main(int argc, char **argv) {
 			       "  -S     Dont show test summary\n"
 			       "  -V <N.N.N.N> Broker version.\n"
                                "  -D     Delete all test topics between each test (-p1) or after all tests\n"
+                               "  -P     Run all tests with `enable.idempotency=true`\n"
 			       "\n"
 			       "Environment variables:\n"
 			       "  TESTS - substring matched test to run (e.g., 0033)\n"
@@ -1405,6 +1462,8 @@ int main(int argc, char **argv) {
         TEST_SAY("Test timeout multiplier: %.1f\n", test_timeout_multiplier);
         TEST_SAY("Action on test failure: %s\n",
                  test_assert_on_fail ? "assert crash" : "continue other tests");
+        if (test_idempotent_producer)
+                TEST_SAY("Test Idempotent Producer: enabled\n");
 
         {
                 char cwd[512], *pcwd;
@@ -1507,16 +1566,35 @@ int main(int argc, char **argv) {
  *
  ******************************************************************************/
 
-void test_dr_cb (rd_kafka_t *rk, void *payload, size_t len,
-                 rd_kafka_resp_err_t err, void *opaque, void *msg_opaque) {
-	int *remainsp = msg_opaque;
+void test_dr_msg_cb (rd_kafka_t *rk, const rd_kafka_message_t *rkmessage,
+                     void *opaque) {
+        int *remainsp = rkmessage->_private;
+        static const char *status_names[] = {
+                [RD_KAFKA_MSG_STATUS_NOT_PERSISTED] = "NotPersisted",
+                [RD_KAFKA_MSG_STATUS_POSSIBLY_PERSISTED] = "PossiblyPersisted",
+                [RD_KAFKA_MSG_STATUS_PERSISTED] = "Persisted"
+        };
 
-        TEST_SAYL(4, "Delivery report: %s\n", rd_kafka_err2str(err));
+        TEST_SAYL(4, "Delivery report: %s (%s)\n",
+                  rd_kafka_err2str(rkmessage->err),
+                  status_names[rd_kafka_message_status(rkmessage)]);
 
-        if (!test_curr->produce_sync && err != test_curr->exp_dr_err)
-                TEST_FAIL("Message delivery failed: expected %s, got %s",
-                          rd_kafka_err2str(test_curr->exp_dr_err),
-                          rd_kafka_err2str(err));
+        if (!test_curr->produce_sync) {
+                if (rkmessage->err != test_curr->exp_dr_err)
+                        TEST_FAIL("Message delivery failed: expected %s, got %s",
+                                  rd_kafka_err2str(test_curr->exp_dr_err),
+                                  rd_kafka_err2str(rkmessage->err));
+
+                if ((int)test_curr->exp_dr_status != -1) {
+                        rd_kafka_msg_status_t status =
+                                rd_kafka_message_status(rkmessage);
+
+                        TEST_ASSERT(status == test_curr->exp_dr_status,
+                                    "Expected message status %s, not %s",
+                                    status_names[test_curr->exp_dr_status],
+                                    status_names[status]);
+                }
+        }
 
 	if (*remainsp == 0)
 		TEST_FAIL("Too many messages delivered (remains %i)",
@@ -1525,7 +1603,7 @@ void test_dr_cb (rd_kafka_t *rk, void *payload, size_t len,
 	(*remainsp)--;
 
         if (test_curr->produce_sync)
-                test_curr->produce_sync_err = err;
+                test_curr->produce_sync_err = rkmessage->err;
 }
 
 
@@ -1560,7 +1638,7 @@ rd_kafka_t *test_create_producer (void) {
 	rd_kafka_conf_t *conf;
 
 	test_conf_init(&conf, NULL, 0);
-	rd_kafka_conf_set_dr_cb(conf, test_dr_cb);
+        rd_kafka_conf_set_dr_msg_cb(conf, test_dr_msg_cb);
 
 	return test_create_handle(RD_KAFKA_PRODUCER, conf);
 }
@@ -1636,7 +1714,7 @@ rd_kafka_topic_t *test_create_producer_topic (rd_kafka_t *rk,
  * Produces \p cnt messages and returns immediately.
  * Does not wait for delivery.
  * \p msgcounterp is incremented for each produced messages and passed
- * as \p msg_opaque which is later used in test_dr_cb to decrement
+ * as \p msg_opaque which is later used in test_dr_msg_cb to decrement
  * the counter on delivery.
  *
  * If \p payload is NULL the message key and payload will be formatted
@@ -2009,32 +2087,51 @@ int64_t test_consume_msgs (const char *what, rd_kafka_topic_t *rkt,
  * and expects \d exp_msgcnt with matching \p testid
  * Destroys consumer when done.
  *
+ * @param partition If -1 the topic will be subscribed to, otherwise the
+ *                  single partition will be assigned immediately.
+ *
  * If \p group_id is NULL a new unique group is generated
  */
 void
 test_consume_msgs_easy_mv (const char *group_id, const char *topic,
+                           int32_t partition,
                            uint64_t testid, int exp_eofcnt, int exp_msgcnt,
                            rd_kafka_topic_conf_t *tconf,
                            test_msgver_t *mv) {
         rd_kafka_t *rk;
         char grpid0[64];
+        rd_kafka_conf_t *conf;
 
-        if (!tconf)
-                test_conf_init(NULL, &tconf, 0);
+        test_conf_init(&conf, tconf ? NULL : &tconf, 0);
 
         if (!group_id)
                 group_id = test_str_id_generate(grpid0, sizeof(grpid0));
 
         test_topic_conf_set(tconf, "auto.offset.reset", "smallest");
-        rk = test_create_consumer(group_id, NULL, NULL, tconf);
+        if (exp_eofcnt != -1)
+                test_conf_set(conf, "enable.partition.eof", "true");
+        rk = test_create_consumer(group_id, NULL, conf, tconf);
 
         rd_kafka_poll_set_consumer(rk);
 
-        TEST_SAY("Subscribing to topic %s in group %s "
-                 "(expecting %d msgs with testid %"PRIu64")\n",
-                 topic, group_id, exp_msgcnt, testid);
+        if (partition == -1) {
+                TEST_SAY("Subscribing to topic %s in group %s "
+                         "(expecting %d msgs with testid %"PRIu64")\n",
+                         topic, group_id, exp_msgcnt, testid);
 
-        test_consumer_subscribe(rk, topic);
+                test_consumer_subscribe(rk, topic);
+        } else {
+                rd_kafka_topic_partition_list_t *plist;
+
+                TEST_SAY("Assign topic %s [%"PRId32"] in group %s "
+                         "(expecting %d msgs with testid %"PRIu64")\n",
+                         topic, partition, group_id, exp_msgcnt, testid);
+
+                plist = rd_kafka_topic_partition_list_new(1);
+                rd_kafka_topic_partition_list_add(plist, topic, partition);
+                test_consumer_assign("consume_easy_mv", rk, plist);
+                rd_kafka_topic_partition_list_destroy(plist);
+        }
 
         /* Consume messages */
         test_consumer_poll("consume.easy", rk, testid, exp_eofcnt,
@@ -2053,7 +2150,7 @@ test_consume_msgs_easy (const char *group_id, const char *topic,
 
         test_msgver_init(&mv, testid);
 
-        test_consume_msgs_easy_mv(group_id, topic, testid, exp_eofcnt,
+        test_consume_msgs_easy_mv(group_id, topic, -1, testid, exp_eofcnt,
                                   exp_msgcnt, tconf, &mv);
 
         test_msgver_clear(&mv);
@@ -3082,7 +3179,8 @@ int test_consumer_poll_once (rd_kafka_t *rk, test_msgver_t *mv, int timeout_ms){
 	rd_kafka_message_destroy(rkmessage);
 	return 1;
 }
-	
+
+
 int test_consumer_poll (const char *what, rd_kafka_t *rk, uint64_t testid,
                         int exp_eof_cnt, int exp_msg_base, int exp_cnt,
 			test_msgver_t *mv) {
@@ -3166,9 +3264,10 @@ void test_flush (rd_kafka_t *rk, int timeout_ms) {
 	err = rd_kafka_flush(rk, timeout_ms);
 	TIMING_STOP(&timing);
 	if (err)
-		TEST_FAIL("Failed to flush(%s, %d): %s\n",
+		TEST_FAIL("Failed to flush(%s, %d): %s: len() = %d\n",
 			  rd_kafka_name(rk), timeout_ms,
-			  rd_kafka_err2str(err));
+			  rd_kafka_err2str(err),
+                          rd_kafka_outq_len(rk));
 }
 
 
@@ -3993,17 +4092,21 @@ test_wait_admin_result (rd_kafka_queue_t *q,
 
 /**
  * @brief Wait for up to \p tmout for a
- *        CreateTopics/DeleteTopics/CreatePartitions result
- *        and return the distilled error code.
+ *        CreateTopics/DeleteTopics/CreatePartitions or
+ *        DescribeConfigs/AlterConfigs result and return the
+ *        distilled error code.
  */
 rd_kafka_resp_err_t
 test_wait_topic_admin_result (rd_kafka_queue_t *q,
                               rd_kafka_event_type_t evtype,
+                              rd_kafka_event_t **retevent,
                               int tmout) {
         rd_kafka_event_t *rkev;
         size_t i;
         const rd_kafka_topic_result_t **terr = NULL;
         size_t terr_cnt = 0;
+        const rd_kafka_ConfigResource_t **cres = NULL;
+        size_t cres_cnt = 0;
         int errcnt = 0;
         rd_kafka_resp_err_t err;
 
@@ -4041,11 +4144,31 @@ test_wait_topic_admin_result (rd_kafka_queue_t *q,
 
                 terr = rd_kafka_CreatePartitions_result_topics(res, &terr_cnt);
 
+        } else if (evtype == RD_KAFKA_EVENT_DESCRIBECONFIGS_RESULT) {
+                const rd_kafka_DescribeConfigs_result_t *res;
+
+                if (!(res = rd_kafka_event_DescribeConfigs_result(rkev)))
+                        TEST_FAIL("Expected a DescribeConfigs result, not %s",
+                                  rd_kafka_event_name(rkev));
+
+                cres = rd_kafka_DescribeConfigs_result_resources(res,
+                                                                 &cres_cnt);
+
+        } else if (evtype == RD_KAFKA_EVENT_ALTERCONFIGS_RESULT) {
+                const rd_kafka_AlterConfigs_result_t *res;
+
+                if (!(res = rd_kafka_event_AlterConfigs_result(rkev)))
+                        TEST_FAIL("Expected a AlterConfigs result, not %s",
+                                  rd_kafka_event_name(rkev));
+
+                cres = rd_kafka_AlterConfigs_result_resources(res, &cres_cnt);
+
         } else {
                 TEST_FAIL("Bad evtype: %d", evtype);
                 RD_NOTREACHED();
         }
 
+        /* Check topic errors */
         for (i = 0 ; i < terr_cnt ; i++) {
                 if (rd_kafka_topic_result_error(terr[i])) {
                         TEST_WARN("..Topics result: %s: error: %s\n",
@@ -4056,7 +4179,22 @@ test_wait_topic_admin_result (rd_kafka_queue_t *q,
                 }
         }
 
-        rd_kafka_event_destroy(rkev);
+        /* Check resource errors */
+        for (i = 0 ; i < cres_cnt ; i++) {
+                if (rd_kafka_ConfigResource_error(cres[i])) {
+                        TEST_WARN("ConfigResource result: %d,%s: error: %s\n",
+                                  rd_kafka_ConfigResource_type(cres[i]),
+                                  rd_kafka_ConfigResource_name(cres[i]),
+                                  rd_kafka_ConfigResource_error_string(cres[i]));
+                        if (!(errcnt++))
+                                err = rd_kafka_ConfigResource_error(cres[i]);
+                }
+        }
+
+        if (!err && retevent)
+                *retevent = rkev;
+        else
+                rd_kafka_event_destroy(rkev);
 
         return err;
 }
@@ -4135,7 +4273,7 @@ test_CreateTopics_simple (rd_kafka_t *rk,
 
         err = test_wait_topic_admin_result(q,
                                            RD_KAFKA_EVENT_CREATETOPICS_RESULT,
-                                           tmout+5000);
+                                           NULL, tmout+5000);
 
         rd_kafka_queue_destroy(q);
 
@@ -4203,7 +4341,7 @@ test_CreatePartitions_simple (rd_kafka_t *rk,
 
 
         err = test_wait_topic_admin_result(
-                q, RD_KAFKA_EVENT_CREATEPARTITIONS_RESULT, tmout+5000);
+                q, RD_KAFKA_EVENT_CREATEPARTITIONS_RESULT, NULL, tmout+5000);
 
         rd_kafka_queue_destroy(q);
 
@@ -4271,7 +4409,7 @@ test_DeleteTopics_simple (rd_kafka_t *rk,
 
         err = test_wait_topic_admin_result(q,
                                            RD_KAFKA_EVENT_CREATETOPICS_RESULT,
-                                           tmout+5000);
+                                           NULL, tmout+5000);
 
         rd_kafka_queue_destroy(q);
 
@@ -4281,6 +4419,97 @@ test_DeleteTopics_simple (rd_kafka_t *rk,
 
         return err;
 }
+
+
+/**
+ * @brief Delta Alter configuration for the given resource,
+ *        overwriting/setting the configs provided in \p configs.
+ *        Existing configuration remains intact.
+ *
+ * @param configs 'const char *name, const char *value' tuples
+ * @param config_cnt is the number of tuples in \p configs
+ */
+rd_kafka_resp_err_t
+test_AlterConfigs_simple (rd_kafka_t *rk,
+                          rd_kafka_ResourceType_t restype,
+                          const char *resname,
+                          const char **configs, size_t config_cnt) {
+        rd_kafka_queue_t *q;
+        rd_kafka_ConfigResource_t *confres;
+        rd_kafka_event_t *rkev;
+        size_t i;
+        rd_kafka_resp_err_t err;
+        const rd_kafka_ConfigResource_t **results;
+        size_t result_cnt;
+        const rd_kafka_ConfigEntry_t **configents;
+        size_t configent_cnt;
+
+
+        q = rd_kafka_queue_new(rk);
+
+        TEST_SAY("Getting configuration for %d %s\n", restype, resname);
+
+        confres = rd_kafka_ConfigResource_new(restype, resname);
+        rd_kafka_DescribeConfigs(rk, &confres, 1, NULL, q);
+
+        err = test_wait_topic_admin_result(
+                q, RD_KAFKA_EVENT_DESCRIBECONFIGS_RESULT, &rkev, 15*1000);
+        if (err) {
+                rd_kafka_queue_destroy(q);
+                rd_kafka_ConfigResource_destroy(confres);
+                return err;
+        }
+
+        results = rd_kafka_DescribeConfigs_result_resources(
+                rd_kafka_event_DescribeConfigs_result(rkev), &result_cnt);
+        TEST_ASSERT(result_cnt == 1,
+                    "expected 1 DescribeConfigs result, not %"PRIusz,
+                    result_cnt);
+
+        configents = rd_kafka_ConfigResource_configs(results[0],
+                                                     &configent_cnt);
+        TEST_ASSERT(configent_cnt > 0,
+                    "expected > 0 ConfigEntry:s, not %"PRIusz, configent_cnt);
+
+        TEST_SAY("Altering configuration for %d %s\n", restype, resname);
+
+        /* Apply all existing configuration entries to resource object that
+         * will later be passed to AlterConfigs. */
+        for (i = 0 ; i < configent_cnt ; i++) {
+                err = rd_kafka_ConfigResource_set_config(
+                        confres,
+                        rd_kafka_ConfigEntry_name(configents[i]),
+                        rd_kafka_ConfigEntry_value(configents[i]));
+                TEST_ASSERT(!err, "Failed to set read-back config %s=%s "
+                            "on local resource object",
+                            rd_kafka_ConfigEntry_name(configents[i]),
+                            rd_kafka_ConfigEntry_value(configents[i]));
+        }
+
+        rd_kafka_event_destroy(rkev);
+
+        /* Then apply the configuration to change. */
+        for (i = 0 ; i < config_cnt ; i += 2) {
+                err = rd_kafka_ConfigResource_set_config(confres,
+                                                         configs[i],
+                                                         configs[i+1]);
+                TEST_ASSERT(!err, "Failed to set config %s=%s on "
+                            "local resource object",
+                            configs[i], configs[i+1]);
+        }
+
+        rd_kafka_AlterConfigs(rk, &confres, 1, NULL, q);
+
+        rd_kafka_ConfigResource_destroy(confres);
+
+        err = test_wait_topic_admin_result(
+                q, RD_KAFKA_EVENT_ALTERCONFIGS_RESULT, NULL, 15*1000);
+
+        rd_kafka_queue_destroy(q);
+
+        return err;
+}
+
 
 
 static void test_free_string_array (char **strs, size_t cnt) {
